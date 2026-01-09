@@ -113,7 +113,6 @@ loss = logits.sum()
 loss.backward()
 
 print("Done running simple model")
-
 ```
 
 ### Full RL Training
