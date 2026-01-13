@@ -17,6 +17,7 @@ This demonstrates:
 7. Optional real dataset support (GSM8K math dataset)
 """
 
+import argparse
 import os
 import re
 
@@ -25,7 +26,6 @@ import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file, save_file
 from torch.utils.tensorboard import SummaryWriter
-
 from torchtitan.experiments.rl.vllm_compat.weights.converter import (
     torchtitan_to_vllm,
     vllm_to_torchtitan,
@@ -33,10 +33,8 @@ from torchtitan.experiments.rl.vllm_compat.weights.converter import (
 from torchtitan.experiments.rl.vllm_compat.weights_vllm_compat import (
     torchtitan_to_vllm_compat,
 )
-
 from torchtitan.models.qwen3.model.args import Qwen3ModelArgs
 from transformers import AutoConfig, AutoTokenizer
-
 from vllm import LLM, SamplingParams
 from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -56,9 +54,15 @@ class VLLMRolloutEngine:
     Args:
         model_path: Path to HuggingFace model (for config/tokenizer)
         temp_checkpoint_dir: Directory to save temporary weight checkpoints
+        compile_vllm: If True, enable CUDA graph compilation (default: False, eager mode)
     """
 
-    def __init__(self, model_path: str, temp_checkpoint_dir: str = "./converted"):
+    def __init__(
+        self,
+        model_path: str,
+        temp_checkpoint_dir: str = "./converted",
+        compile_vllm: bool = False,
+    ):
         self.base_model_path = model_path
         self.temp_model_dir = os.path.abspath(
             os.path.join(temp_checkpoint_dir, "vllm_temp_model")
@@ -94,6 +98,7 @@ class VLLMRolloutEngine:
             shutil.copy2(index_file, self.temp_model_dir)
 
         self.llm = None
+        self.compile_vllm = compile_vllm
         print("vLLM rollout engine initialized (will load on first use)")
 
     def update_weights(self, vllm_compat_state: dict) -> None:
@@ -171,10 +176,10 @@ class VLLMRolloutEngine:
                 dtype="bfloat16",
                 gpu_memory_utilization=0.3,  # Reduced from 0.5
                 seed=42,  # Fixed seed for determinism
-                enforce_eager=True,
+                enforce_eager=not self.compile_vllm,
                 attention_config={"backend": AttentionBackendEnum.FLASH_ATTN},
             )
-            print("✓ Created new vLLM engine")
+            print(f"✓ Created new vLLM engine (compile_vllm={self.compile_vllm})")
         else:
             # Use collective_rpc to call reload_weights on all workers
             # This reloads weights from temp_model_dir without recreating the engine
@@ -1019,8 +1024,27 @@ def compute_weight_deltas(model: torch.nn.Module, initial_state: dict) -> dict:
     return deltas
 
 
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Simple RL training loop with GRPO-style advantage estimation."
+    )
+    parser.add_argument(
+        "--compile-vllm",
+        action="store_true",
+        help="Enable CUDA graph compilation for vLLM (default: eager mode)",
+    )
+    parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Enable torch.compile for the TorchTitan model",
+    )
+    return parser.parse_args()
+
+
 def main():
     """Simple RL training loop using vLLM for fast rollouts."""
+    args = parse_args()
 
     # ========== Config ==========
     model_name = "Qwen/Qwen3-1.7B"  # HuggingFace model name
@@ -1082,6 +1106,9 @@ def main():
     )
     model = model.to(device)
     model.train()
+    if args.torch_compile:
+        print("Compiling model with torch.compile...")
+        model.compile()
 
     # Save initial weights for delta computation (on CPU to save GPU memory)
     print("Saving initial weights for tracking...")
@@ -1091,7 +1118,7 @@ def main():
 
     # Initialize persistent vLLM engine for rollouts
     print("\nInitializing vLLM engine for rollouts...")
-    vllm_engine = VLLMRolloutEngine(model_path)
+    vllm_engine = VLLMRolloutEngine(model_path, compile_vllm=args.compile_vllm)
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
