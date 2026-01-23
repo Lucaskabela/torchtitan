@@ -1024,6 +1024,455 @@ def compute_weight_deltas(model: torch.nn.Module, initial_state: dict) -> dict:
     return deltas
 
 
+def test_model_equivalence(
+    model_name: str = "Qwen/Qwen3-1.7B",
+    cache_dir: str = "./models",
+    output_dir: str = "./converted",
+    seq_len: int = 15,
+) -> bool:
+    """
+    Test mode: Load vLLM and TorchTitan models and compare outputs with dummy input.
+
+    Args:
+        model_name: HuggingFace model name
+        cache_dir: Directory to cache the downloaded model
+        output_dir: Directory to save converted weights
+        seq_len: Sequence length for dummy input
+
+    Returns:
+        True if models produce equivalent outputs, False otherwise
+    """
+    print("=" * 80)
+    print("MODEL EQUIVALENCE TEST")
+    print("=" * 80)
+
+    # Download and convert model
+    print(f"\n[1/5] Downloading and converting {model_name}...")
+    titan_checkpoint_path, model_path = download_and_convert_model(
+        model_name, cache_dir, output_dir
+    )
+
+    # Load tokenizer for vocab size
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    vocab_size = tokenizer.vocab_size
+
+    # Load TorchTitan model
+    print("\n[2/5] Loading TorchTitan model...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    titan_model = load_model(titan_checkpoint_path, model_path, use_vllm_compat=True)
+    titan_model = titan_model.to(device)
+    titan_model.eval()
+
+    # Create vLLM model for comparison
+    print("\n[3/5] Loading vLLM model...")
+    temp_model_dir = os.path.abspath(os.path.join(output_dir, "vllm_test_model"))
+    os.makedirs(temp_model_dir, exist_ok=True)
+
+    # Copy config/tokenizer files
+    import shutil
+
+    for file in [
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "merges.txt",
+        "vocab.json",
+    ]:
+        src = os.path.join(model_path, file)
+        if os.path.exists(src):
+            shutil.copy2(src, temp_model_dir)
+
+    # Convert TorchTitan weights to vLLM format and save
+    titan_state = titan_model.state_dict()
+    vllm_compat_state = torchtitan_to_vllm_compat(titan_state)
+    vllm_state = torchtitan_to_vllm(vllm_compat_state)
+    vllm_state = {
+        k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v
+        for k, v in vllm_state.items()
+    }
+    save_file(vllm_state, os.path.join(temp_model_dir, "model.safetensors"))
+
+    # Create vLLM engine
+    vllm_model = LLM(
+        model=temp_model_dir,
+        trust_remote_code=True,
+        max_model_len=2048,
+        dtype="bfloat16",
+        gpu_memory_utilization=0.3,
+        seed=42,
+        enforce_eager=False,
+        attention_config={"backend": AttentionBackendEnum.FLASH_ATTN},
+    )
+    # Create dummy input
+    print(f"\n[4/5] Running forward pass with dummy input (seq_len={seq_len})...")
+    torch.manual_seed(42)
+    dummy_input = torch.randint(0, vocab_size, (1, seq_len), device=device)
+
+    print(f"  Input shape: {dummy_input.shape}")
+    print(f"  Input tokens: {dummy_input[0, :8].tolist()}...")
+
+    # Run TorchTitan forward pass
+    print("\n  Running TorchTitan forward pass...")
+    with torch.no_grad():
+        titan_output = titan_model(dummy_input)
+    print(f"  TorchTitan output shape: {titan_output.shape}")
+
+    # Get vLLM logprobs for comparison via generate API
+    print("\n  Running vLLM forward pass...")
+    # Decode dummy input to text for vLLM
+    prompt_text = tokenizer.decode(dummy_input[0].tolist(), skip_special_tokens=False)
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=1,
+        prompt_logprobs=seq_len,
+    )
+    vllm_outputs = vllm_model.generate([prompt_text], sampling_params)
+
+    # Extract prompt logprobs from vLLM
+    vllm_prompt_logprobs = vllm_outputs[0].prompt_logprobs
+
+    # Compare outputs
+    print("\n[5/5] Comparing outputs...")
+
+    # Get TorchTitan logprobs
+    titan_log_probs = F.log_softmax(titan_output.float(), dim=-1)
+
+    # Compare at each position where vLLM has logprobs
+    mismatches = 0
+    total_compared = 0
+    max_diff = 0.0
+
+    for pos in range(1, seq_len):
+        if pos < len(vllm_prompt_logprobs) and vllm_prompt_logprobs[pos] is not None:
+            token_id = dummy_input[0, pos].item()
+            if token_id in vllm_prompt_logprobs[pos]:
+                vllm_lp = vllm_prompt_logprobs[pos][token_id].logprob
+                titan_lp = titan_log_probs[0, pos - 1, token_id].item()
+
+                diff = abs(vllm_lp - titan_lp)
+                max_diff = max(max_diff, diff)
+                total_compared += 1
+
+                if diff > 1e-5:
+                    mismatches += 1
+                    if mismatches <= 5:
+                        print(
+                            f"  Position {pos}, token {token_id}: "
+                            f"vLLM={vllm_lp:.6f}, TorchTitan={titan_lp:.6f}, diff={diff:.2e}"
+                        )
+
+    print(f"\n  Compared {total_compared} positions")
+    print(f"  Mismatches (diff > 1e-5): {mismatches}")
+    print(f"  Max difference: {max_diff:.2e}")
+
+    # Determine pass/fail
+    passed = mismatches == 0
+    print("\n" + "=" * 80)
+    if passed:
+        print("✓ TEST PASSED: Models produce equivalent outputs")
+    else:
+        print(f"✗ TEST FAILED: {mismatches}/{total_compared} positions differ")
+    print("=" * 80)
+
+    # Cleanup
+    del vllm_model
+    torch.cuda.empty_cache()
+
+    return passed
+
+
+def test_layer_by_layer_divergence(
+    model_name: str = "Qwen/Qwen3-1.7B",
+    cache_dir: str = "./models",
+    output_dir: str = "./converted",
+    seq_len: int = 15,
+) -> None:
+    """
+    Debug mode: Find where numerical divergence starts by comparing layer-by-layer.
+
+    Hooks into intermediate activations of the TorchTitan model and compares
+    against vLLM's internal model weights/computations.
+
+    Args:
+        model_name: HuggingFace model name
+        cache_dir: Directory to cache the downloaded model
+        output_dir: Directory to save converted weights
+        seq_len: Sequence length for dummy input
+    """
+    print("=" * 80)
+    print("LAYER-BY-LAYER DIVERGENCE TEST")
+    print("=" * 80)
+
+    # Download and convert model
+    print("\n[1/4] Setting up models...")
+    titan_checkpoint_path, model_path = download_and_convert_model(
+        model_name, cache_dir, output_dir
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    vocab_size = tokenizer.vocab_size
+
+    # Load TorchTitan model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    titan_model = load_model(titan_checkpoint_path, model_path, use_vllm_compat=True)
+    titan_model = titan_model.to(device)
+    titan_model.eval()
+
+    # Load vLLM's internal model for direct comparison
+    print("\n[2/4] Loading vLLM internal model...")
+
+    # CRITICAL: Disable multiprocessing to get direct model access
+    # Without this, the model lives in a separate process and can't be accessed directly
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
+    temp_model_dir = os.path.abspath(os.path.join(output_dir, "vllm_test_model"))
+    os.makedirs(temp_model_dir, exist_ok=True)
+
+    import shutil
+
+    for file in [
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "merges.txt",
+        "vocab.json",
+    ]:
+        src = os.path.join(model_path, file)
+        if os.path.exists(src):
+            shutil.copy2(src, temp_model_dir)
+
+    titan_state = titan_model.state_dict()
+    vllm_compat_state = torchtitan_to_vllm_compat(titan_state)
+    vllm_state = torchtitan_to_vllm(vllm_compat_state)
+    vllm_state = {
+        k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v
+        for k, v in vllm_state.items()
+    }
+    save_file(vllm_state, os.path.join(temp_model_dir, "model.safetensors"))
+
+    # Create dummy input
+    print(f"\n[3/4] Running layer-by-layer comparison (seq_len={seq_len})...")
+    torch.manual_seed(42)
+    dummy_input = torch.randint(0, vocab_size, (1, seq_len), device=device)
+    print(f"  Input tokens: {dummy_input[0, :8].tolist()}...")
+
+    # Collect intermediate activations from TorchTitan
+    activations = {}
+
+    def make_hook(name):
+        def hook(module, input, output):  # noqa: F841
+            if isinstance(output, tuple):
+                activations[name] = output[0].detach().clone()
+            else:
+                activations[name] = output.detach().clone()
+
+        return hook
+
+    # Register hooks on key points
+    hooks = []
+    hooks.append(
+        titan_model.tok_embeddings.register_forward_hook(make_hook("embedding"))
+    )
+    for i, layer in enumerate(titan_model.layers.values()):
+        hooks.append(
+            layer.attention_norm.register_forward_hook(
+                make_hook(f"layer_{i}_attn_norm")
+            )
+        )
+        hooks.append(
+            layer.attention.register_forward_hook(make_hook(f"layer_{i}_attn_out"))
+        )
+        hooks.append(
+            layer.ffn_norm.register_forward_hook(make_hook(f"layer_{i}_ffn_norm"))
+        )
+        hooks.append(
+            layer.feed_forward.register_forward_hook(make_hook(f"layer_{i}_ffn_out"))
+        )
+        hooks.append(layer.register_forward_hook(make_hook(f"layer_{i}_out")))
+    hooks.append(titan_model.norm.register_forward_hook(make_hook("final_norm")))
+    hooks.append(titan_model.output.register_forward_hook(make_hook("logits")))
+
+    # Run TorchTitan forward pass
+    with torch.no_grad():
+        titan_output = titan_model(dummy_input)
+
+    # Remove hooks
+    for h in hooks:
+        h.remove()
+
+    # Now load vLLM model and run the same input through it with hooks
+    # Since vLLM's LLM class doesn't give direct model access, we load it differently
+
+    vllm_activations = {}
+
+    def make_vllm_hook(name):
+        def hook(module, input, output):  # noqa: F841
+            if isinstance(output, tuple):
+                vllm_activations[name] = output[0].detach().clone()
+            else:
+                vllm_activations[name] = output.detach().clone()
+
+        return hook
+
+    # Load vLLM model using their loader
+    print("\n  Loading vLLM model for direct comparison...")
+    try:
+        # Try to get the internal model from an LLM instance
+        vllm_llm = LLM(
+            model=temp_model_dir,
+            trust_remote_code=True,
+            max_model_len=2048,
+            dtype="bfloat16",
+            gpu_memory_utilization=0.3,
+            seed=42,
+            enforce_eager=True,
+            attention_config={"backend": AttentionBackendEnum.FLASH_ATTN},
+        )
+        # Access internal model directly (works because we disabled multiprocessing)
+        # vLLM v1 structure: LLM -> LLMEngine -> EngineCoreClient -> EngineCore -> Executor -> Worker -> model
+        engine_core = vllm_llm.llm_engine.engine_core
+
+        # InprocClient has engine_core attribute pointing to EngineCore
+        if hasattr(engine_core, "engine_core"):
+            model_executor = engine_core.engine_core.model_executor
+            vllm_internal_model = model_executor.driver_worker.worker.get_model()
+        else:
+            print(
+                "\n  ✗ Could not access vLLM internal model - multiprocessing may still be enabled"
+            )
+            print(f"    engine_core type: {type(engine_core)}")
+            raise RuntimeError(
+                "Failed to access vLLM internal model. "
+                "Make sure VLLM_ENABLE_V1_MULTIPROCESSING=0 is set before creating the LLM."
+            )
+
+        if vllm_internal_model is None:
+            print("\n  ✗ vLLM internal model is None")
+            raise RuntimeError("vLLM internal model is None")
+
+        print(f"  ✓ Accessed vLLM internal model: {type(vllm_internal_model)}")
+
+        # Register hooks on vLLM model
+        vllm_hooks = []
+        if hasattr(vllm_internal_model, "model"):
+            vllm_model_inner = vllm_internal_model.model
+            if hasattr(vllm_model_inner, "embed_tokens"):
+                vllm_hooks.append(
+                    vllm_model_inner.embed_tokens.register_forward_hook(
+                        make_vllm_hook("embedding")
+                    )
+                )
+            if hasattr(vllm_model_inner, "layers"):
+                for i, layer in enumerate(vllm_model_inner.layers):
+                    if hasattr(layer, "input_layernorm"):
+                        vllm_hooks.append(
+                            layer.input_layernorm.register_forward_hook(
+                                make_vllm_hook(f"layer_{i}_attn_norm")
+                            )
+                        )
+                    if hasattr(layer, "self_attn"):
+                        vllm_hooks.append(
+                            layer.self_attn.register_forward_hook(
+                                make_vllm_hook(f"layer_{i}_attn_out")
+                            )
+                        )
+                    if hasattr(layer, "post_attention_layernorm"):
+                        vllm_hooks.append(
+                            layer.post_attention_layernorm.register_forward_hook(
+                                make_vllm_hook(f"layer_{i}_ffn_norm")
+                            )
+                        )
+                    if hasattr(layer, "mlp"):
+                        vllm_hooks.append(
+                            layer.mlp.register_forward_hook(
+                                make_vllm_hook(f"layer_{i}_ffn_out")
+                            )
+                        )
+                    vllm_hooks.append(
+                        layer.register_forward_hook(make_vllm_hook(f"layer_{i}_out"))
+                    )
+            if hasattr(vllm_model_inner, "norm"):
+                vllm_hooks.append(
+                    vllm_model_inner.norm.register_forward_hook(
+                        make_vllm_hook("final_norm")
+                    )
+                )
+        if hasattr(vllm_internal_model, "lm_head"):
+            vllm_hooks.append(
+                vllm_internal_model.lm_head.register_forward_hook(
+                    make_vllm_hook("logits")
+                )
+            )
+
+        # Run vLLM through generate to trigger the forward pass with hooks
+        prompt_text = tokenizer.decode(
+            dummy_input[0].tolist(), skip_special_tokens=False
+        )
+        sampling_params = SamplingParams(
+            temperature=0.0, max_tokens=1, prompt_logprobs=seq_len
+        )
+        vllm_outputs = vllm_llm.generate([prompt_text], sampling_params)
+
+        # Remove hooks
+        for h in vllm_hooks:
+            h.remove()
+
+        # Compare activations
+        print("\n[4/4] Comparing intermediate activations...")
+        print("-" * 80)
+
+        first_divergence = None
+        for name in activations.keys():
+            titan_act = activations[name].squeeze()
+
+            if name in vllm_activations:
+                vllm_act = vllm_activations[name].squeeze()
+
+                # Handle shape differences
+                if titan_act.shape != vllm_act.shape:
+                    print(f"  {name}: SHAPE MISMATCH")
+                    print(f"    TorchTitan: {titan_act.shape}")
+                    print(f"    vLLM:       {vllm_act.shape}")
+                    continue
+
+                # Compute difference metrics
+                diff = (titan_act.float() - vllm_act.float()).abs()
+                max_diff = diff.max().item()
+                mean_diff = diff.mean().item()
+                num_exact = (diff == 0).sum().item()
+                total = diff.numel()
+
+                status = "✓" if max_diff < 1e-5 else "✗"
+                print(f"  {status} {name}:")
+                pct = 100 * num_exact / total
+                print(
+                    f"      max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e}, "
+                    f"exact_match={num_exact}/{total} ({pct:.1f}%)"
+                )
+
+                if max_diff >= 1e-5 and first_divergence is None:
+                    first_divergence = name
+            else:
+                print(f"  ? {name}: Not found in vLLM activations")
+
+        print("-" * 80)
+        if first_divergence:
+            print(f"\n⚠ FIRST DIVERGENCE at: {first_divergence}")
+        else:
+            print("\n✓ No significant divergence found in any layer")
+
+        del vllm_llm
+        torch.cuda.empty_cache()
+
+    except Exception as e:
+        print(f"  Error during vLLM comparison: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -1039,12 +1488,32 @@ def parse_args():
         action="store_true",
         help="Enable torch.compile for the TorchTitan model",
     )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run model equivalence test instead of training",
+    )
+    parser.add_argument(
+        "--debug-layers",
+        action="store_true",
+        help="Run layer-by-layer divergence debugging to find where numerics diverge",
+    )
     return parser.parse_args()
 
 
 def main():
     """Simple RL training loop using vLLM for fast rollouts."""
     args = parse_args()
+
+    # Handle test mode
+    if args.test:
+        success = test_model_equivalence()
+        exit(0 if success else 1)
+
+    # Handle layer-by-layer debug mode
+    if args.debug_layers:
+        test_layer_by_layer_divergence()
+        exit(0)
 
     # ========== Config ==========
     model_name = "Qwen/Qwen3-1.7B"  # HuggingFace model name
