@@ -1577,7 +1577,7 @@ def main():
     model.train()
     if args.torch_compile:
         print("Compiling model with torch.compile...")
-        model.compile()
+        model.compile(backend="aot_eager", fullgraph=True)
 
     # Save initial weights for delta computation (on CPU to save GPU memory)
     print("Saving initial weights for tracking...")
