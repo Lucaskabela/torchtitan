@@ -20,7 +20,7 @@ from .validate import build_flux_validator
 __all__ = [
     "FluxModelArgs",
     "FluxModel",
-    # pyrefly: ignore [missing-module-attribute]
+    # pyrefly: ignore [bad-dunder-all, missing-module-attribute]
     "flux_configs",
     "parallelize_flux",
 ]
