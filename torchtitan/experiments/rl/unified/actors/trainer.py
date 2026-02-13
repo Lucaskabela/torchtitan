@@ -47,6 +47,9 @@ class Trainer(Actor):
         model_mode: str = ModelMode.VLLM_COMPAT,
         ddp_size: int = 1,
         tp_size: int = 1,
+        compile_titan_model: bool = False,
+        compile_max_seq_len: int = 2048,
+        compile_cudagraph: bool = False,
     ):
         # Explicitly set cuda device for each trainer, otherwise different processes will use the same CUDA device
         local_rank = int(os.environ["LOCAL_RANK"])
@@ -60,6 +63,22 @@ class Trainer(Actor):
         self.tp_size = tp_size
         self.parallel_dims = create_trainer_parallel_dims(self.ddp_size, self.tp_size)
 
+        self.model = self.model.to(device)
+        self.model.train()
+
+        # Compile BEFORE DDP: AOT export traces self.inner (the unwrapped model),
+        # so DDP's forward_pre_hook (which uses @torch._disable_dynamo) must not
+        # be on the model being traced.  DDP is then applied to the
+        # RLCompiledModule wrapper, whose forward() is never traced by Dynamo.
+        if compile_titan_model:
+            from torchtitan.experiments.rl.compile_utils import compile_rl_model
+
+            self.model = compile_rl_model(
+                self.model,
+                max_seq_len=compile_max_seq_len,
+                use_cudagraph=compile_cudagraph,
+            )
+
         # apply PT-D Parallelism
         # TODO: right now it only works for qwen3 model, need to formalize this to use parallize_fn from train_spec
         from torchtitan.models.llama3.infra.parallelize import apply_ddp
@@ -69,9 +88,6 @@ class Trainer(Actor):
             self.parallel_dims.get_mesh("dp_replicate"),
             enable_compile=False,
         )
-
-        self.model = self.model.to(device)
-        self.model.train()
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
@@ -101,7 +117,11 @@ class Trainer(Actor):
         logger.info(
             f"{os.getpid()=} Trainer starts to train {self.policy_version} on traj:"
         )
-        # Compute loss
+        # Zero grads before loss computation (backward happens inside
+        # compute_policy_gradient_loss_vllm via per-sample gradient accumulation)
+        self.optimizer.zero_grad()
+
+        # Compute loss (backward already done inside, loss is detached)
         loss, loss_metrics = compute_policy_gradient_loss_vllm(
             self.model,
             trajectory.vllm_token_ids,
@@ -112,8 +132,6 @@ class Trainer(Actor):
         )
 
         # Update weights
-        self.optimizer.zero_grad()
-        loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
 
