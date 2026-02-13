@@ -64,6 +64,10 @@ async def main():
     trainer_tp_size = 1
     generator_tp_size = 1
 
+    # Compilation config
+    compile_titan_model = False
+    compile_max_seq_len = 2048
+
     init_batch_invariance(AttentionBackendEnum.FLASH_ATTN)
     batch_invariant = vllm_is_batch_invariant()
     mode = ModelMode.UNIFIED
@@ -136,6 +140,8 @@ async def main():
         mode,
         trainer_ddp_size,
         trainer_tp_size,
+        compile_titan_model,
+        compile_max_seq_len,
     )
 
     generator = gen_mesh.spawn(

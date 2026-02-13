@@ -6,10 +6,172 @@
 
 
 import math
-from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
+from torch._subclasses.fake_tensor import FakeTensor
+from torch._subclasses.functional_tensor import FunctionalTensor
 from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+
+
+def _is_tracing(t: torch.Tensor) -> bool:
+    """Check if tensor is a FakeTensor or FunctionalTensor (used during tracing)."""
+    return isinstance(t, (FakeTensor, FunctionalTensor))
+
+
+class FlashAttnWithBackward(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        seq_len: int,
+        scale: float,
+        num_splits: int,
+    ) -> torch.Tensor:
+        if _is_tracing(q):
+            # Pure PyTorch fallback for tracing (FakeTensors can't call .data_ptr())
+            total_tokens = q.shape[0]
+            num_heads = q.shape[1]
+            head_dim = q.shape[2]
+            batch_size = total_tokens // seq_len
+
+            q_b = q.reshape(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+            k_b = k.reshape(batch_size, seq_len, k.shape[1], head_dim).transpose(1, 2)
+            v_b = v.reshape(batch_size, seq_len, v.shape[1], head_dim).transpose(1, 2)
+            output_b = F.scaled_dot_product_attention(
+                q_b, k_b, v_b, scale=scale, is_causal=True
+            )
+            output = output_b.transpose(1, 2).reshape(total_tokens, num_heads, head_dim)
+        else:
+            # Call flash attention for forward (fast)
+            from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+
+            output = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=seq_len,
+                max_seqlen_k=seq_len,
+                softmax_scale=scale,
+                causal=True,
+                num_splits=num_splits,
+                fa_version=get_flash_attn_version(),
+                out=out,
+            )
+
+        # Save for backward
+        ctx.save_for_backward(q, k, v, output)
+        ctx.scale = scale
+        ctx.seq_len = seq_len
+        return output
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None, None,]:
+        q, k, v, output = ctx.saved_tensors
+        scale = ctx.scale
+        seq_len = ctx.seq_len
+
+        # Reshape from varlen back to batch format for attention computation
+        # Assume uniform sequence lengths (batch_size = total_tokens / seq_len)
+        total_tokens = q.shape[0]
+        num_heads = q.shape[1]
+        num_kv_heads = k.shape[1]
+        head_dim = q.shape[2]
+        batch_size = total_tokens // seq_len
+
+        q_batch = q.reshape(batch_size, seq_len, num_heads, head_dim)
+        k_batch = k.reshape(batch_size, seq_len, num_kv_heads, head_dim)
+        v_batch = v.reshape(batch_size, seq_len, num_kv_heads, head_dim)
+        out_batch = output.reshape(batch_size, seq_len, num_heads, head_dim)
+        grad_out_batch = grad_output.reshape(batch_size, seq_len, num_heads, head_dim)
+
+        # Transpose to (batch, num_heads, seq_len, head_dim)
+        q_t = q_batch.transpose(1, 2)
+        k_t = k_batch.transpose(1, 2)
+        v_t = v_batch.transpose(1, 2)
+        out_t = out_batch.transpose(1, 2)
+        grad_out_t = grad_out_batch.transpose(1, 2)
+
+        # For GQA, we need to expand K/V to match Q's num_heads
+        # Each KV head serves (num_heads // num_kv_heads) Q heads
+        if num_kv_heads < num_heads:
+            assert enable_gqa, "GQA requires enable_gqa=True"
+            assert (
+                num_heads % num_kv_heads == 0
+            ), "num_heads must be a multiple of num_kv_heads"
+            n_rep = num_heads // num_kv_heads
+            k_t = k_t.repeat_interleave(n_rep, dim=1)
+            v_t = v_t.repeat_interleave(n_rep, dim=1)
+
+        # Compute attention scores: QK^T
+        # q_t: (B, H, N, D), k_t: (B, H, N, D) -> scores: (B, H, N, N)
+        scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * scale
+
+        # Apply causal mask
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        scores = scores.masked_fill(causal_mask, float("-inf"))
+
+        # Softmax
+        attn_weights = torch.nn.functional.softmax(scores, dim=-1)  # (B, H, N, N)
+
+        # Backward through attention
+        # out = attn_weights @ v
+        # grad_v = attn_weights^T @ grad_out
+        grad_v_t = torch.matmul(attn_weights.transpose(-2, -1), grad_out_t)
+
+        # grad_attn_weights = grad_out @ v^T
+        grad_attn_weights = torch.matmul(grad_out_t, v_t.transpose(-2, -1))
+
+        # Backward through softmax
+        # d_softmax = attn_weights * (grad_attn_weights - sum(grad_attn_weights * attn_weights))
+        sum_term = (grad_attn_weights * attn_weights).sum(dim=-1, keepdim=True)
+        grad_scores = attn_weights * (grad_attn_weights - sum_term)
+
+        # Apply causal mask to gradients
+        grad_scores = grad_scores.masked_fill(causal_mask, 0.0)
+
+        # Backward through QK^T and scale
+        grad_scores = grad_scores * scale
+
+        # grad_q = grad_scores @ K
+        grad_q_t = torch.matmul(grad_scores, k_t)
+
+        # grad_k = grad_scores^T @ Q
+        grad_k_t = torch.matmul(grad_scores.transpose(-2, -1), q_t)
+
+        # Transpose back and reshape to varlen format
+        grad_q = grad_q_t.transpose(1, 2).reshape(total_tokens, num_heads, head_dim)
+
+        # For GQA, we need to reduce grad_k and grad_v back to num_kv_heads
+        if num_kv_heads < num_heads:
+            assert enable_gqa, "GQA requires enable_gqa=True"
+            assert (
+                num_heads % num_kv_heads == 0
+            ), "num_heads must be a multiple of num_kv_heads"
+            n_rep = num_heads // num_kv_heads
+            # Reshape and sum over the repeated dimension
+            grad_k_t = grad_k_t.reshape(
+                batch_size, num_kv_heads, n_rep, seq_len, head_dim
+            ).sum(dim=2)
+            grad_v_t = grad_v_t.reshape(
+                batch_size, num_kv_heads, n_rep, seq_len, head_dim
+            ).sum(dim=2)
+
+        grad_k = grad_k_t.transpose(1, 2).reshape(total_tokens, num_kv_heads, head_dim)
+        grad_v = grad_v_t.transpose(1, 2).reshape(total_tokens, num_kv_heads, head_dim)
+
+        return grad_q, grad_k, grad_v, None, None, None, None, None
 
 
 class VLLMCompatibleFlashAttention(torch.nn.Module):
@@ -17,12 +179,9 @@ class VLLMCompatibleFlashAttention(torch.nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.flash_attn_varlen_func = flash_attn_varlen_func
         from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
-        from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 
-        self.vllm_is_batch_invariant = vllm_is_batch_invariant
-        self.fa_version = get_flash_attn_version()
+        self._num_splits = 1 if vllm_is_batch_invariant() else 0
 
     def forward(
         self,
@@ -70,164 +229,6 @@ class VLLMCompatibleFlashAttention(torch.nn.Module):
         )
 
         # Wrap Flash Attention with manual backward pass
-        class FlashAttnWithBackward(torch.autograd.Function):
-            @staticmethod
-            def forward(
-                ctx: torch.autograd.function.FunctionCtx,
-                q: torch.Tensor,
-                k: torch.Tensor,
-                v: torch.Tensor,
-                out: torch.Tensor,
-                cu_seqlens: torch.Tensor,
-                seq_len: int,
-                scale: float,
-                num_splits: int,
-                flash_fn: Callable[..., torch.Tensor],
-                fa_version: int,
-            ) -> torch.Tensor:
-                # Call flash attention for forward (fast)
-                output = flash_fn(
-                    q,
-                    k,
-                    v,
-                    cu_seqlens_q=cu_seqlens,
-                    cu_seqlens_k=cu_seqlens,
-                    max_seqlen_q=seq_len,
-                    max_seqlen_k=seq_len,
-                    softmax_scale=scale,
-                    causal=True,
-                    num_splits=num_splits,
-                    fa_version=fa_version,
-                    out=out,
-                )
-                # Save for backward
-                ctx.save_for_backward(q, k, v, output)
-                ctx.scale = scale
-                ctx.seq_len = seq_len
-                return output
-
-            @staticmethod
-            def backward(
-                ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
-            ) -> tuple[
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ]:
-                q, k, v, output = ctx.saved_tensors
-                scale = ctx.scale
-                seq_len = ctx.seq_len
-
-                # Reshape from varlen back to batch format for attention computation
-                # Assume uniform sequence lengths (batch_size = total_tokens / seq_len)
-                total_tokens = q.shape[0]
-                num_heads = q.shape[1]
-                num_kv_heads = k.shape[1]
-                head_dim = q.shape[2]
-                batch_size = total_tokens // seq_len
-
-                q_batch = q.reshape(batch_size, seq_len, num_heads, head_dim)
-                k_batch = k.reshape(batch_size, seq_len, num_kv_heads, head_dim)
-                v_batch = v.reshape(batch_size, seq_len, num_kv_heads, head_dim)
-                out_batch = output.reshape(batch_size, seq_len, num_heads, head_dim)
-                grad_out_batch = grad_output.reshape(
-                    batch_size, seq_len, num_heads, head_dim
-                )
-
-                # Transpose to (batch, num_heads, seq_len, head_dim)
-                q_t = q_batch.transpose(1, 2)
-                k_t = k_batch.transpose(1, 2)
-                v_t = v_batch.transpose(1, 2)
-                out_t = out_batch.transpose(1, 2)
-                grad_out_t = grad_out_batch.transpose(1, 2)
-
-                # For GQA, we need to expand K/V to match Q's num_heads
-                # Each KV head serves (num_heads // num_kv_heads) Q heads
-                if num_kv_heads < num_heads:
-                    assert enable_gqa, "GQA requires enable_gqa=True"
-                    assert (
-                        num_heads % num_kv_heads == 0
-                    ), "num_heads must be a multiple of num_kv_heads"
-                    n_rep = num_heads // num_kv_heads
-                    k_t = k_t.repeat_interleave(n_rep, dim=1)
-                    v_t = v_t.repeat_interleave(n_rep, dim=1)
-
-                # Compute attention scores: QK^T
-                # q_t: (B, H, N, D), k_t: (B, H, N, D) -> scores: (B, H, N, N)
-                scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * scale
-
-                # Apply causal mask
-                causal_mask = torch.triu(
-                    torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool),
-                    diagonal=1,
-                )
-                scores = scores.masked_fill(causal_mask, float("-inf"))
-
-                # Softmax
-                attn_weights = torch.nn.functional.softmax(
-                    scores, dim=-1
-                )  # (B, H, N, N)
-
-                # Backward through attention
-                # out = attn_weights @ v
-                # grad_v = attn_weights^T @ grad_out
-                grad_v_t = torch.matmul(attn_weights.transpose(-2, -1), grad_out_t)
-
-                # grad_attn_weights = grad_out @ v^T
-                grad_attn_weights = torch.matmul(grad_out_t, v_t.transpose(-2, -1))
-
-                # Backward through softmax
-                # d_softmax = attn_weights * (grad_attn_weights - sum(grad_attn_weights * attn_weights))
-                sum_term = (grad_attn_weights * attn_weights).sum(dim=-1, keepdim=True)
-                grad_scores = attn_weights * (grad_attn_weights - sum_term)
-
-                # Apply causal mask to gradients
-                grad_scores = grad_scores.masked_fill(causal_mask, 0.0)
-
-                # Backward through QK^T and scale
-                grad_scores = grad_scores * scale
-
-                # grad_q = grad_scores @ K
-                grad_q_t = torch.matmul(grad_scores, k_t)
-
-                # grad_k = grad_scores^T @ Q
-                grad_k_t = torch.matmul(grad_scores.transpose(-2, -1), q_t)
-
-                # Transpose back and reshape to varlen format
-                grad_q = grad_q_t.transpose(1, 2).reshape(
-                    total_tokens, num_heads, head_dim
-                )
-
-                # For GQA, we need to reduce grad_k and grad_v back to num_kv_heads
-                if num_kv_heads < num_heads:
-                    assert enable_gqa, "GQA requires enable_gqa=True"
-                    assert (
-                        num_heads % num_kv_heads == 0
-                    ), "num_heads must be a multiple of num_kv_heads"
-                    n_rep = num_heads // num_kv_heads
-                    # Reshape and sum over the repeated dimension
-                    grad_k_t = grad_k_t.reshape(
-                        batch_size, num_kv_heads, n_rep, seq_len, head_dim
-                    ).sum(dim=2)
-                    grad_v_t = grad_v_t.reshape(
-                        batch_size, num_kv_heads, n_rep, seq_len, head_dim
-                    ).sum(dim=2)
-
-                grad_k = grad_k_t.transpose(1, 2).reshape(
-                    total_tokens, num_kv_heads, head_dim
-                )
-                grad_v = grad_v_t.transpose(1, 2).reshape(
-                    total_tokens, num_kv_heads, head_dim
-                )
-
-                return grad_q, grad_k, grad_v, None, None, None, None, None, None, None
 
         # Call Flash Attention varlen with custom backward
         output_varlen = FlashAttnWithBackward.apply(
@@ -238,9 +239,7 @@ class VLLMCompatibleFlashAttention(torch.nn.Module):
             cu_seqlens,
             seq_len,
             scale,
-            1 if self.vllm_is_batch_invariant() else 0,
-            self.flash_attn_varlen_func,
-            self.fa_version,
+            self._num_splits,
         )
 
         # Convert back to batch format

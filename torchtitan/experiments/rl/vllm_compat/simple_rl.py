@@ -1045,6 +1045,10 @@ def main():
     )
     num_dataset_samples = 10  # Number of prompts from dataset
 
+    # Compilation config
+    compile_titan_model = True
+    compile_max_seq_len = 2048  # matches vLLM max_model_len
+
     # Check if batch invariance is enabled
     from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 
@@ -1082,6 +1086,11 @@ def main():
     )
     model = model.to(device)
     model.train()
+
+    if compile_titan_model:
+        from torchtitan.experiments.rl.compile_utils import compile_rl_model
+
+        model = compile_rl_model(model, max_seq_len=compile_max_seq_len)
 
     # Save initial weights for delta computation (on CPU to save GPU memory)
     print("Saving initial weights for tracking...")

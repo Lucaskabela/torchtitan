@@ -47,6 +47,8 @@ class Trainer(Actor):
         model_mode: str = ModelMode.VLLM_COMPAT,
         ddp_size: int = 1,
         tp_size: int = 1,
+        compile_titan_model: bool = False,
+        compile_max_seq_len: int = 2048,
     ):
         # Explicitly set cuda device for each trainer, otherwise different processes will use the same CUDA device
         local_rank = int(os.environ["LOCAL_RANK"])
@@ -72,6 +74,11 @@ class Trainer(Actor):
 
         self.model = self.model.to(device)
         self.model.train()
+
+        if compile_titan_model:
+            from torchtitan.experiments.rl.compile_utils import compile_rl_model
+
+            self.model = compile_rl_model(self.model, max_seq_len=compile_max_seq_len)
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
