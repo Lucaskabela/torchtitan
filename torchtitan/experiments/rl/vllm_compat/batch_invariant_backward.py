@@ -35,7 +35,14 @@ Usage:
 """
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
+from torch._subclasses.functional_tensor import FunctionalTensor
 from torch.autograd import Function
+
+
+def _is_tracing(t: torch.Tensor) -> bool:
+    """Check if tensor is a FakeTensor or FunctionalTensor (used during tracing)."""
+    return isinstance(t, (FakeTensor, FunctionalTensor))
 
 
 # ============================================================================
@@ -62,20 +69,27 @@ class SiluAndMulFunction(Function):
         Returns:
             output: silu(gate) * up, shape [..., hidden_dim]
         """
-        from vllm.config import set_current_vllm_config, VllmConfig
-        from vllm.model_executor.layers.activation import SiluAndMul as VLLMSiluAndMul
+        if _is_tracing(x):
+            # Pure PyTorch fallback for tracing (FakeTensors can't call .data_ptr())
+            d = x.shape[-1] // 2
+            output = torch.nn.functional.silu(x[..., :d]) * x[..., d:]
+        else:
+            from vllm.config import set_current_vllm_config, VllmConfig
+            from vllm.model_executor.layers.activation import (
+                SiluAndMul as VLLMSiluAndMul,
+            )
 
-        # Use vLLM's implementation for forward
-        # vLLM custom ops require a config context to be set
-        # Since these are parameter free we instantiate default config
-        with set_current_vllm_config(VllmConfig()):
-            # compile_native=False to avoid compiling the inner details of
-            # the CustomOp for now - NOTE: if we enable compile in vLLM in
-            # the future, we need to compile this op as well.
-            # see vllm-project/vllm#32806  for more details
-            vllm_silu_and_mul = VLLMSiluAndMul(compile_native=False)
+            # Use vLLM's implementation for forward
+            # vLLM custom ops require a config context to be set
+            # Since these are parameter free we instantiate default config
+            with set_current_vllm_config(VllmConfig()):
+                # compile_native=False to avoid compiling the inner details of
+                # the CustomOp for now - NOTE: if we enable compile in vLLM in
+                # the future, we need to compile this op as well.
+                # see vllm-project/vllm#32806  for more details
+                vllm_silu_and_mul = VLLMSiluAndMul(compile_native=False)
 
-        output = vllm_silu_and_mul(x)
+            output = vllm_silu_and_mul(x)
 
         # Save for backward
         ctx.save_for_backward(x)
@@ -139,10 +153,18 @@ class RMSNormFunction(Function):
         Returns:
             output: Normalized and scaled tensor [*, hidden_size]
         """
-        from vllm.model_executor.layers.batch_invariant import rms_norm as vllm_rms_norm
+        if _is_tracing(input):
+            # Pure PyTorch fallback for tracing (FakeTensors can't call .data_ptr())
+            variance = (input * input).mean(dim=-1, keepdim=True)
+            rms = torch.sqrt(variance + eps)
+            output = (input / rms) * weight
+        else:
+            from vllm.model_executor.layers.batch_invariant import (
+                rms_norm as vllm_rms_norm,
+            )
 
-        # Use vLLM's Triton kernel for forward (deterministic)
-        output = vllm_rms_norm(input, weight, eps)
+            # Use vLLM's Triton kernel for forward (deterministic)
+            output = vllm_rms_norm(input, weight, eps)
 
         # Save for backward
         ctx.save_for_backward(input, weight)
