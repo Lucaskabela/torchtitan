@@ -19,6 +19,7 @@ This demonstrates:
 
 import os
 import re
+import time
 
 import torch
 import torch.nn.functional as F
@@ -169,7 +170,7 @@ class VLLMRolloutEngine:
                 trust_remote_code=True,
                 max_model_len=2048,
                 dtype="bfloat16",
-                gpu_memory_utilization=0.3,  # Reduced from 0.5
+                gpu_memory_utilization=0.3,
                 seed=42,  # Fixed seed for determinism
                 enforce_eager=True,
                 attention_config={"backend": AttentionBackendEnum.FLASH_ATTN},
@@ -853,7 +854,7 @@ def compute_policy_gradient_loss_vllm(
 
         if bitwise_identical:
             print(
-                f"  ✓ vLLM-TorchTitan bitwise determinism verified: {len(first_sample_deltas)} tokens match exactly"
+                f"  ✓ vLLM-TorchTitan bitwise determinism verified: {num_tokens} tokens match exactly"
             )
         else:
             num_different = (vllm_lps_f32 != titan_lps_f32).sum().item()
@@ -861,7 +862,7 @@ def compute_policy_gradient_loss_vllm(
             max_delta = deltas.max().item()
             avg_delta = deltas.mean().item()
             print(
-                f"  ⚠ vLLM-TorchTitan logprobs differ: {num_different}/{len(first_sample_deltas)} tokens"
+                f"  ⚠ vLLM-TorchTitan logprobs differ: {num_different}/{num_tokens} tokens"
             )
             print(f"    Max delta: {max_delta:.6e}, Avg delta: {avg_delta:.6e}")
             print(
@@ -1262,7 +1263,8 @@ def main():
         print(
             f"\nStep {step:3d} | Loss: {metrics['loss']:.4f} | "
             f"Reward: {metrics['reward_mean']:+.3f} | "
-            f"Samples: {metrics['total_samples']}"
+            f"Samples: {metrics['total_samples']} | "
+            f"fw+bw: {metrics['fw_bw_time_sec']:.2f}s ({metrics['fw_bw_samples_per_sec']:.1f} samples/s)"
         )
         print(f"  Sample: {metrics['sample_completions'][0][:80]}...")
 
