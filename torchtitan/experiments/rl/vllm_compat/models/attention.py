@@ -83,6 +83,15 @@ def _flash_attn_setup_context(ctx, inputs, output):
 
 
 def _flash_attn_backward(ctx, grad_output):
+    """Backward pass for flash attention.
+
+    Recomputes the full attention matrix (scores, softmax) from saved Q, K, V
+    rather than saving the O(batch * heads * seq^2) attention weights from the
+    forward pass.  This trades extra compute for lower peak memory, which is
+    the standard FlashAttention-2 approach.  For very long sequences the
+    materialized scores tensor can still be significant
+    (e.g. seq_len=2048, 16 heads, batch=4 ≈ 1 GB in float32).
+    """
     q, k, v = ctx.saved_tensors
     scale = ctx.scale
     seq_len = ctx.seq_len

@@ -64,6 +64,11 @@ async def main():
     trainer_tp_size = 1
     generator_tp_size = 1
 
+    # Compilation config
+    compile_titan_model = True
+    compile_max_seq_len = 2048
+    compile_cudagraph = True
+
     init_batch_invariance(AttentionBackendEnum.FLASH_ATTN)
     batch_invariant = vllm_is_batch_invariant()
     mode = ModelMode.UNIFIED
@@ -136,6 +141,9 @@ async def main():
         mode,
         trainer_ddp_size,
         trainer_tp_size,
+        compile_titan_model,
+        compile_max_seq_len,
+        compile_cudagraph,
     )
 
     generator = gen_mesh.spawn(
@@ -171,7 +179,8 @@ async def main():
 
         logger.info(
             f"\nStep {step:3d} | Loss: {metrics['loss']:.4f} | "
-            f"Reward: {metrics['reward_mean']:+.3f}"
+            f"Reward: {metrics['reward_mean']:+.3f} | "
+            f"Ratio: {metrics.get('ratio_mean', 0):.3f}"
         )
         logger.info(f"  Sample: {metrics['sample_completion']}...")
 

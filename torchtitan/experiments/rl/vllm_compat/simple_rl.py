@@ -17,9 +17,9 @@ This demonstrates:
 7. Optional real dataset support (GSM8K math dataset)
 """
 
+import logging
 import os
 import re
-import time
 
 import torch
 import torch.nn.functional as F
@@ -41,6 +41,8 @@ from transformers import AutoConfig, AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+logger = logging.getLogger(__name__)
 
 
 init_batch_invariance(AttentionBackendEnum.FLASH_ATTN)
@@ -706,7 +708,7 @@ def compute_policy_gradient_loss_vllm(
     while mbs > 1 and batch_size % mbs != 0:
         mbs -= 1
     if mbs != micro_batch_size:
-        print(
+        logger.warning(
             f"  Adjusted micro_batch_size from {micro_batch_size} to {mbs} "
             f"(must evenly divide batch_size={batch_size})"
         )
@@ -854,7 +856,7 @@ def compute_policy_gradient_loss_vllm(
 
         if bitwise_identical:
             print(
-                f"  ✓ vLLM-TorchTitan bitwise determinism verified: {num_tokens} tokens match exactly"
+                f"  ✓ vLLM-TorchTitan bitwise determinism verified: {len(first_sample_deltas)} tokens match exactly"
             )
         else:
             num_different = (vllm_lps_f32 != titan_lps_f32).sum().item()
@@ -862,7 +864,7 @@ def compute_policy_gradient_loss_vllm(
             max_delta = deltas.max().item()
             avg_delta = deltas.mean().item()
             print(
-                f"  ⚠ vLLM-TorchTitan logprobs differ: {num_different}/{num_tokens} tokens"
+                f"  ⚠ vLLM-TorchTitan logprobs differ: {num_different}/{len(first_sample_deltas)} tokens"
             )
             print(f"    Max delta: {max_delta:.6e}, Avg delta: {avg_delta:.6e}")
             print(
@@ -1114,6 +1116,11 @@ def main():
     )
     num_dataset_samples = 10  # Number of prompts from dataset
 
+    # Compilation config
+    compile_titan_model = True
+    compile_max_seq_len = 2048  # matches vLLM max_model_len
+    compile_cudagraph = True  # wrap compiled fw/bw graphs with CUDAGraph
+
     # Check if batch invariance is enabled
     from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 
@@ -1151,6 +1158,13 @@ def main():
     )
     model = model.to(device)
     model.train()
+
+    if compile_titan_model:
+        from torchtitan.experiments.rl.compile_utils import compile_rl_model
+
+        model = compile_rl_model(
+            model, max_seq_len=compile_max_seq_len, use_cudagraph=compile_cudagraph
+        )
 
     # Save initial weights for delta computation (on CPU to save GPU memory)
     print("Saving initial weights for tracking...")
@@ -1263,8 +1277,7 @@ def main():
         print(
             f"\nStep {step:3d} | Loss: {metrics['loss']:.4f} | "
             f"Reward: {metrics['reward_mean']:+.3f} | "
-            f"Samples: {metrics['total_samples']} | "
-            f"fw+bw: {metrics['fw_bw_time_sec']:.2f}s ({metrics['fw_bw_samples_per_sec']:.1f} samples/s)"
+            f"Samples: {metrics['total_samples']}"
         )
         print(f"  Sample: {metrics['sample_completions'][0][:80]}...")
 

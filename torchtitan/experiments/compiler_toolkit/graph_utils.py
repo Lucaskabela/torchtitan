@@ -47,6 +47,9 @@ def export_joint(
         args: Tuple of input arguments
         kwargs: Dict of keyword arguments for the model
         dump_folder: Optional folder to dump the graph to
+
+    Returns:
+        Tuple of (joint_with_descriptors, tracing_context).
     """
     if kwargs is None:
         kwargs = {}
@@ -73,6 +76,55 @@ def export_joint(
         return (
             aot_export_joint_with_descriptors_alone(gm, args, kwargs),
             tracing_context,
+        )
+
+
+def export_joint_with_gm(
+    model, args, kwargs=None, dump_folder: str | None = None
+) -> tuple[JointWithDescriptors, TracingContext, torch.fx.GraphModule]:
+    """
+    Export joint forward-backward graph with AOT Autograd, also returning the
+    Dynamo-captured graph module.
+
+    This is useful when callers need access to the graph module's parameters
+    and buffers (e.g. to handle tied weights via ``remove_duplicate=False``).
+
+    Args:
+        model: The model to export
+        args: Tuple of input arguments
+        kwargs: Dict of keyword arguments for the model
+        dump_folder: Optional folder to dump the graph to
+
+    Returns:
+        Tuple of (joint_with_descriptors, tracing_context, gm) where gm is the
+        Dynamo-captured graph module.
+    """
+    if kwargs is None:
+        kwargs = {}
+    assert isinstance(args, tuple)
+    assert isinstance(kwargs, dict)
+    with (
+        # TODO Investigate error on MOE model with use_grouped_mm=False.
+        # For repro, see: https://gist.github.com/zhxchen17/d794ff58236243d9faddf713b9fc6a61
+        torch._dynamo.config.patch(fake_tensor_cache_enabled=False),
+        torch.fx.traceback.preserve_node_meta(),
+    ):
+        gm = dynamo_graph_capture_for_export(model)(*args, **kwargs)
+        logger.debug("Dynamo gm:")
+        logger.debug(
+            gm.print_readable(
+                print_output=False, include_stride=True, include_device=True
+            )
+        )
+        _dump_gm(dump_folder, gm, "dynamo_gm")
+
+        tracing_context = gm.meta["tracing_context"]
+
+    with tracing(tracing_context):
+        return (
+            aot_export_joint_with_descriptors_alone(gm, args, kwargs),
+            tracing_context,
+            gm,
         )
 
 
@@ -109,31 +161,42 @@ def joint_graph_builder(
     joint_custom_passes: Optional[List[Callable]] = None,
     dump_folder: str | None = None,
     job_config: Optional["JobConfig"] = None,
+    validate_dtensor: bool = True,
 ):
     """
     Build a joint forward-backward graph for the model with optional custom compilers.
 
     Args:
         model: The model to compile
-        model_args: Tuple of model input arguments (should be DTensors)
+        model_args: Tuple of model input arguments (should be DTensors when validate_dtensor=True)
         model_kwargs: Dict of model input keyword arguments
         fw_compiler: Optional custom forward compiler function
         bw_compiler: Optional custom backward compiler function
         joint_custom_passes: list of custom passes to run on the joint graph
         dump_folder: Optional folder to dump the graph to
         job_config: Job configuration
+        validate_dtensor: If True, assert that model_args are DTensors (default).
+                         Set to False for non-DTensor use cases (e.g. RL).
     """
     assert isinstance(model_args, tuple)
-    for idx, arg in enumerate(model_args):
-        assert isinstance(arg, DTensor), f"Argument {idx} is of type {type(arg)}"
+    if validate_dtensor:
+        for idx, arg in enumerate(model_args):
+            assert isinstance(arg, DTensor), f"Argument {idx} is of type {type(arg)}"
 
     # get joint graph
-    (joint_with_descriptors, tracing_context,) = export_joint(
+    (joint_with_descriptors, tracing_context, gm,) = export_joint_with_gm(
         model,
         model_args,
         model_kwargs,
         dump_folder=dump_folder,
     )
+
+    # Collect parameters and buffers from the Dynamo-captured graph module.
+    # Using remove_duplicate=False ensures tied weights (e.g. tok_embeddings.weight
+    # and output.weight pointing to the same tensor) are listed separately,
+    # matching the primals the compiled function expects.
+    graph_params = [p for _, p in gm.named_parameters(remove_duplicate=False)]
+    graph_buffers = [b for _, b in gm.named_buffers(remove_duplicate=False)]
 
     # Check if inductor_decomposition is configured and create the pass with proper context
     if job_config is not None:
@@ -171,8 +234,8 @@ def joint_graph_builder(
 
     def wrapper_fn(args, kwargs):
         inputs = [
-            *model.parameters(),
-            *model.buffers(),
+            *graph_params,
+            *graph_buffers,
             *args,
         ]
         return fn(*inputs, **kwargs)
