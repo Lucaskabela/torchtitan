@@ -29,6 +29,7 @@ import torch.library
 # ============================================================================
 
 
+<<<<<<< HEAD
 _cached_silu_and_mul = None
 
 # Avoid reinstantiating SiluAndMul each time it's called
@@ -94,6 +95,64 @@ def rms_norm_op(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.
     return vllm_rms_norm(input, weight, eps)
 
 
+=======
+@torch.library.custom_op("vllm_compat::silu_and_mul", mutates_args=())
+def silu_and_mul_op(x: torch.Tensor) -> torch.Tensor:
+    """SiluAndMul activation using vLLM's implementation.
+
+    Splits input into [gate, up], returns silu(gate) * up.
+    """
+    from vllm.config import set_current_vllm_config, VllmConfig
+    from vllm.model_executor.layers.activation import SiluAndMul as VLLMSiluAndMul
+
+    with set_current_vllm_config(VllmConfig()):
+        vllm_silu_and_mul = VLLMSiluAndMul(compile_native=False)
+    return vllm_silu_and_mul(x)
+
+
+@silu_and_mul_op.register_fake
+def silu_and_mul_fake(x: torch.Tensor) -> torch.Tensor:
+    d = x.shape[-1] // 2
+    return x[..., :d].contiguous()
+
+
+def _silu_and_mul_setup_context(ctx, inputs, output):
+    (x,) = inputs
+    ctx.save_for_backward(x)
+
+
+def _silu_and_mul_backward(ctx, grad_output):
+    (x,) = ctx.saved_tensors
+    d = x.shape[-1] // 2
+    gate = x[..., :d]
+    up = x[..., d:]
+
+    sigmoid_gate = torch.sigmoid(gate)
+    silu_gate = gate * sigmoid_gate
+    d_silu_gate = sigmoid_gate * (1 + gate * (1 - sigmoid_gate))
+
+    grad_gate = grad_output * up * d_silu_gate
+    grad_up = grad_output * silu_gate
+    grad_x = torch.cat([grad_gate, grad_up], dim=-1)
+    return (grad_x,)
+
+
+torch.library.register_autograd(
+    "vllm_compat::silu_and_mul",
+    _silu_and_mul_backward,
+    setup_context=_silu_and_mul_setup_context,
+)
+
+
+@torch.library.custom_op("vllm_compat::rms_norm", mutates_args=())
+def rms_norm_op(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMS normalization using vLLM's Triton kernel."""
+    from vllm.model_executor.layers.batch_invariant import rms_norm as vllm_rms_norm
+
+    return vllm_rms_norm(input, weight, eps)
+
+
+>>>>>>> 57ffef9 (Make RL model compilable: ops rewrite + per-sample backward)
 @rms_norm_op.register_fake
 def rms_norm_fake(
     input: torch.Tensor, weight: torch.Tensor, eps: float
