@@ -27,6 +27,7 @@ from torchtitan.models.qwen3.model.model import precompute_rope_cache
 from torchtitan.protocols.model import BaseModelArgs, ModelProtocol
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from torchtitan.protocols.train_spec import ParallelizeFunction
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
@@ -73,6 +74,9 @@ def _patched_weak_ref_tensor(tensor):
 _vllm_torch_utils.weak_ref_tensor = _patched_weak_ref_tensor
 
 
+@support_torch_compile(
+    dynamic_arg_dims={"input_ids": 0, "positions": 0, "inputs_embeds": 0}
+)
 class TorchTitanVLLMModelWrapper(nn.Module):
     """
     Generic vLLM-compatible model wrapper for TorchTitan models. Implemented
