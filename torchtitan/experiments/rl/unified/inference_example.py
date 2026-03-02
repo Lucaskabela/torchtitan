@@ -11,7 +11,7 @@ Example inference script using TorchTitan models with vLLM LLMEngine.
 This script uses the RL unified config_registry to configure both
 the vLLM engine and sampling parameters.
 
-Run: torchrun --nproc_per_node=<world_size> \
+Run: torchrun --nproc_per_node=2 \
       torchtitan/experiments/rl/unified/infer.py
 """
 import os
@@ -74,6 +74,20 @@ def generate():
         # HuggingFace overrides
         hf_overrides={"architectures": [VLLM_MODEL_NAME]},
     )
+    if gen_config.compilation_backend is not None:
+        from torchtitan.experiments.rl.unified.actors.generator import (
+            _resolve_cudagraph_mode,
+        )
+        from vllm.config import CompilationConfig
+
+        cudagraph_mode = _resolve_cudagraph_mode(
+            gen_config.cudagraph_mode,
+            gen_config.parallelism.tensor_parallel_degree,
+        )
+        engine_kwargs["compilation_config"] = CompilationConfig(
+            backend=gen_config.compilation_backend,
+            cudagraph_mode=cudagraph_mode,
+        )
     if gen_config.seed is not None:
         engine_kwargs["seed"] = gen_config.seed
     engine_args = EngineArgs(**engine_kwargs)

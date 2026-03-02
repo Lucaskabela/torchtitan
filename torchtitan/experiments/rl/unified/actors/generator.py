@@ -8,6 +8,7 @@ import logging
 import os
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 import torch
 from monarch.actor import Actor, endpoint
@@ -24,12 +25,29 @@ from torchtitan.experiments.rl.unified.types import Episode
 from torchtitan.protocols.model_spec import ModelSpec
 from vllm import EngineArgs, LLMEngine, SamplingParams
 
-from vllm.config import AttentionConfig
+from vllm.config import AttentionConfig, CompilationConfig
 from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_cudagraph_mode(cudagraph_mode: str, tp_degree: int) -> str:
+    """Resolve cudagraph mode when full capture is incompatible with TP.
+
+    Full CUDA graph capture hangs with TP > 1 because DTensor's
+    redistribute (all-gather) uses NCCL collectives that are not
+    compatible with CUDA graph capture.  Fall back to piecewise
+    which naturally breaks the graph around collectives.
+    """
+    if tp_degree > 1 and cudagraph_mode in ("full_and_piecewise", "full"):
+        logger.warning(
+            "Changed cudagraph_mode to 'piecewise' for TP > 1 "
+            "(full capture incompatible with DTensor collectives)"
+        )
+        return "piecewise"
+    return cudagraph_mode
 
 
 @dataclass(kw_only=True, slots=True)
@@ -83,8 +101,18 @@ class VLLMGenerator(Actor, Configurable):
         gpu_memory_limit: float = 0.5
         """Fraction of GPU memory to use for the vLLM engine (0.0 to 1.0)."""
 
-        enforce_eager: bool = True
-        """Disable CUDA graphs in vLLM (use eager execution)."""
+        enforce_eager: bool = False
+        """When True, disables compile/cudagraph optimization.  Useful for debugging but harms performance."""
+
+        compilation_backend: Literal["eager", "inductor"] | None = None
+        """torch.compile backend for vLLM.
+        When set, enables compilation. Requires ``enforce_eager=False``."""
+
+        cudagraph_mode: Literal[
+            "none", "piecewise", "full", "full_and_piecewise"
+        ] = "full_and_piecewise"
+        """CUDA graph capture mode for vLLM.
+        See https://docs.vllm.ai/en/latest/design/v1/torch_compile.html#cuda-graph"""
 
         num_samples_per_prompt: int = 8
         """Number of completions to generate per prompt."""
@@ -101,6 +129,11 @@ class VLLMGenerator(Actor, Configurable):
         batch_invariant_mode: bool,
         prompt_texts: list[str],
     ):
+        if config.compilation_backend is not None and config.enforce_eager:
+            raise ValueError(
+                "enforce_eager must be False when compilation_backend is provided"
+            )
+
         self.config = config
         self.model_spec = model_spec
 
@@ -138,6 +171,15 @@ class VLLMGenerator(Actor, Configurable):
                 backend=AttentionBackendEnum[config.attention_backend],
             ),
         )
+        if config.compilation_backend is not None:
+            cudagraph_mode = _resolve_cudagraph_mode(
+                config.cudagraph_mode,
+                config.parallelism.tensor_parallel_degree,
+            )
+            engine_kwargs["compilation_config"] = CompilationConfig(
+                backend=config.compilation_backend,
+                cudagraph_mode=cudagraph_mode,
+            )
         if config.seed is not None:
             engine_kwargs["seed"] = config.seed
         engine_args = EngineArgs(**engine_kwargs)

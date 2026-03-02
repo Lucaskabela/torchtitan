@@ -49,7 +49,9 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",
             gpu_memory_limit=0.5,
-            enforce_eager=True,
+            enforce_eager=False,
+            compilation_backend="eager",
+            cudagraph_mode="full_and_piecewise",
             parallelism=ParallelismConfig(
                 tensor_parallel_degree=2,
             ),
@@ -87,7 +89,9 @@ def rl_grpo_qwen3_debug() -> RLTrainer.Config:
         ),
         generator=VLLMGenerator.Config(
             gpu_memory_limit=0.3,
-            enforce_eager=True,
+            enforce_eager=False,
+            compilation_backend="eager",
+            cudagraph_mode="full_and_piecewise",
             parallelism=ParallelismConfig(
                 tensor_parallel_degree=1,
             ),
