@@ -62,12 +62,16 @@ def compute_policy_gradient_loss(
     kl_coef: float = 0.1,
     ppo_clip_eps: float = 0.2,
     entropy_coef: float = 0.01,
-) -> tuple[torch.Tensor, dict, list[torch.Tensor]]:
+    microbatch_size: int = 1,
+) -> tuple[float, dict, list[torch.Tensor]]:
     """
     Compute GRPO/PPO policy gradient loss with per-token KL divergence.
 
-    Uses per-token log ratios (averaged across tokens) instead of per-sequence
-    sums to prevent ratio explosion when sequences are long.
+    Uses microbatched forward+backward passes: each microbatch of samples runs
+    forward then backward immediately, accumulating gradients. This is
+    mathematically identical to a single forward+backward over all samples and
+    enables CUDAGraph compatibility (which requires a 1:1 forward:backward
+    pattern).
 
     Args:
         model: Current policy model
@@ -78,73 +82,96 @@ def compute_policy_gradient_loss(
         kl_coef: KL divergence penalty coefficient
         ppo_clip_eps: PPO clipping epsilon
         entropy_coef: Entropy bonus coefficient
+        microbatch_size: Number of samples per forward+backward pass
 
     Returns:
-        loss: Total loss (PG + entropy + KL)
+        loss_value: Total loss as a Python float (backward already called)
         metrics: Training metrics dict
-        batch_token_log_probs: List of per-token log probs for each sample (for verification)
+        batch_token_log_probs: List of detached per-token log probs for each
+            sample (for verification)
     """
     device = next(model.parameters()).device
     advantages = advantages.to(device)
 
-    # Compute per-token log probs under current policy (WITH GRADIENTS)
-    batch_token_log_probs = []
+    N = len(vllm_token_ids)
+    # Total generated tokens across all samples (for entropy scaling)
+    T_total = sum(len(gen_toks) for gen_toks in vllm_token_ids)
 
-    for prompt_toks, gen_toks in zip(prompt_token_ids, vllm_token_ids):
-        token_lps = compute_token_log_probs(model, prompt_toks, gen_toks, device)
-        batch_token_log_probs.append(token_lps)
+    # Accumulators for metrics
+    total_loss_value = 0.0
+    total_pg_loss = 0.0
+    total_entropy_sum = 0.0  # sum of all token log probs
+    total_kl_sum = 0.0  # sum of per-sample mean KLs
+    all_ratios = []
+    all_clipped_flags = []
+    batch_token_log_probs = []  # detached, for verification
 
-    # Per-token log ratios and KL, averaged across tokens per sample
-    per_sample_mean_log_ratio = []
-    per_sample_mean_kl = []
-    all_token_log_probs = []
+    # Process samples in microbatches
+    for mb_start in range(0, N, microbatch_size):
+        mb_end = min(mb_start + microbatch_size, N)
 
-    for policy_token_lps, ref_token_lps in zip(
-        batch_token_log_probs, ref_token_log_probs
-    ):
-        # Per-token log ratio: log(pi/pi_ref) for each token
-        token_log_ratio = policy_token_lps - ref_token_lps.detach()
-        # Average across tokens in this sequence
-        per_sample_mean_log_ratio.append(token_log_ratio.mean())
-        # Per-token KL: E[ratio - 1 - log_ratio] (Schulman approx)
-        token_ratio = torch.exp(token_log_ratio)
-        token_kl = token_ratio - 1 - token_log_ratio
-        per_sample_mean_kl.append(token_kl.mean())
-        all_token_log_probs.append(policy_token_lps)
+        mb_loss_terms = []
 
-    mean_log_ratio = torch.stack(per_sample_mean_log_ratio)  # [batch]
-    mean_kl = torch.stack(per_sample_mean_kl)  # [batch]
+        for i in range(mb_start, mb_end):
+            # Forward pass with gradients
+            token_lps = compute_token_log_probs(
+                model, prompt_token_ids[i], vllm_token_ids[i], device
+            )
+            # Save detached copy for verification
+            batch_token_log_probs.append(token_lps.detach())
 
-    # PPO clipped objective using per-token-averaged ratio
-    ratio = torch.exp(mean_log_ratio)
-    unclipped_loss = ratio * advantages
-    clipped_ratio = torch.clamp(ratio, 1 - ppo_clip_eps, 1 + ppo_clip_eps)
-    clipped_loss = clipped_ratio * advantages
-    pg_loss = -torch.min(unclipped_loss, clipped_loss).mean()
+            # Per-token log ratio: log(pi/pi_ref)
+            ref_lps = ref_token_log_probs[i].detach()
+            token_log_ratio = token_lps - ref_lps
+            mean_log_ratio = token_log_ratio.mean()
 
-    # Entropy bonus (averaged across all tokens)
-    all_token_lps = torch.cat(all_token_log_probs)
-    entropy = -all_token_lps.mean()
-    entropy_bonus = -entropy_coef * entropy
+            # KL divergence (Schulman approximation): E[ratio - 1 - log_ratio]
+            token_ratio = torch.exp(token_log_ratio)
+            token_kl = token_ratio - 1 - token_log_ratio
+            mean_kl = token_kl.mean()
 
-    # KL divergence penalty (averaged across samples)
-    kl_div = mean_kl.mean()
+            # PPO clipped objective
+            ratio = torch.exp(mean_log_ratio)
+            adv_i = advantages[i]
+            unclipped = ratio * adv_i
+            clipped_ratio = torch.clamp(ratio, 1 - ppo_clip_eps, 1 + ppo_clip_eps)
+            clipped = clipped_ratio * adv_i
 
-    # Total loss
-    total_loss = pg_loss + entropy_bonus + kl_coef * kl_div
+            # Per-sample loss contributions (scaled for correct total)
+            pg_term = -torch.min(unclipped, clipped) / N
+            entropy_term = entropy_coef * token_lps.sum() / T_total
+            kl_term = kl_coef * mean_kl / N
+
+            mb_loss_terms.append(pg_term + entropy_term + kl_term)
+
+            # Collect detached metrics
+            with torch.no_grad():
+                total_pg_loss += pg_term.item()
+                total_entropy_sum += token_lps.sum().item()
+                total_kl_sum += mean_kl.item()
+                all_ratios.append(ratio.item())
+                all_clipped_flags.append(
+                    float(torch.abs(ratio - clipped_ratio).item() > 1e-6)
+                )
+
+        # Backward on this microbatch (accumulates gradients)
+        microbatch_loss = torch.stack(mb_loss_terms).sum()
+        microbatch_loss.backward()
+        total_loss_value += microbatch_loss.item()
+
+    # Compute final metrics
+    entropy = -total_entropy_sum / T_total
+    kl_div = total_kl_sum / N
 
     metrics = {
-        "pg_loss": pg_loss.item(),
-        "entropy": entropy.item(),
-        "kl_div": kl_div.item(),
-        "ratio_mean": ratio.mean().item(),
-        "ratio_clipped_frac": (torch.abs(ratio - clipped_ratio) > 1e-6)
-        .float()
-        .mean()
-        .item(),
+        "pg_loss": total_pg_loss,
+        "entropy": entropy,
+        "kl_div": kl_div,
+        "ratio_mean": sum(all_ratios) / len(all_ratios),
+        "ratio_clipped_frac": sum(all_clipped_flags) / len(all_clipped_flags),
     }
 
-    return total_loss, metrics, batch_token_log_probs
+    return total_loss_value, metrics, batch_token_log_probs
 
 
 def verify_logprob_identity(

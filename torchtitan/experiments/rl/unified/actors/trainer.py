@@ -38,6 +38,20 @@ from torchtitan.tools import utils
 logger = logging.getLogger(__name__)
 
 
+@dataclass(kw_only=True, slots=True)
+class TrainerCompileConfig:
+    """Configuration for AOT-compiling the trainer policy model."""
+
+    max_seq_len: int = 2048
+    """Fixed sequence length for AOT tracing (inputs are padded to this)."""
+
+    cudagraph: bool = False
+    """Wrap compiled fw/bw graphs with CUDAGraph for further speedup."""
+
+    microbatch_size: int = 1
+    """Number of samples per forward+backward pass. Default 1 for CUDAGraph compatibility."""
+
+
 class PolicyTrainer(Actor, Configurable):
     """
     Updates policy based on collected Episode using TorchTitan components.
@@ -64,6 +78,9 @@ class PolicyTrainer(Actor, Configurable):
         parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
         comm: CommConfig = field(default_factory=CommConfig)
         """Communication configuration for distributed initialization."""
+
+        compile: "TrainerCompileConfig | None" = None
+        """AOT compilation config. Set to enable compile + optional CUDAGraph."""
 
     def __init__(
         self,
@@ -109,6 +126,23 @@ class PolicyTrainer(Actor, Configurable):
             model_spec, config, device_type, batch_invariant_mode, hf_assets_path
         )
         model.train()
+
+        # AOT-compile the policy model if requested.
+        if config.compile is not None:
+            from torchtitan.experiments.rl.compile_utils import compile_rl_model
+
+            model = compile_rl_model(
+                model,
+                max_seq_len=config.compile.max_seq_len,
+                parallel_dims=self.parallel_dims,
+                use_cudagraph=config.compile.cudagraph,
+            )
+            logger.info(
+                f"Compiled policy model (max_seq_len={config.compile.max_seq_len}, "
+                f"cudagraph={config.compile.cudagraph}, "
+                f"tp={self.parallel_dims.tp})"
+            )
+
         self.model = model
         self.model_parts = [model]
 
@@ -289,14 +323,25 @@ class PolicyTrainer(Actor, Configurable):
                 )
                 ref_token_log_probs.append(token_lps)
 
-        # Compute loss on this rank's shard
-        loss, loss_metrics, batch_token_log_probs = compute_policy_gradient_loss(
+        # Determine microbatch size: use compile config if available,
+        # otherwise use full batch (no microbatching, original behavior).
+        if self.config.compile is not None:
+            microbatch_size = self.config.compile.microbatch_size
+        else:
+            microbatch_size = len(my_token_ids)
+
+        # Zero gradients before microbatched forward+backward
+        self.optimizers.zero_grad()
+
+        # Compute loss on this rank's shard (backward happens inside per microbatch)
+        loss_value, loss_metrics, batch_token_log_probs = compute_policy_gradient_loss(
             self.model,
             my_token_ids,
             my_prompt_token_ids,
             my_advantages,
             ref_token_log_probs,
             kl_coef=0.1,
+            microbatch_size=microbatch_size,
         )
 
         # Verify logprob identity (local shard)
@@ -311,10 +356,6 @@ class PolicyTrainer(Actor, Configurable):
             f"diff_max={verification_result['logprob_diff_max']:.6e}, "
             f"tokens_checked={verification_result['total_tokens_checked']}"
         )
-
-        # Update weights
-        self.optimizers.zero_grad()
-        loss.backward()
 
         # All-reduce gradients across DP ranks so all ranks have consistent
         # weight updates despite processing different data shards.
@@ -338,7 +379,7 @@ class PolicyTrainer(Actor, Configurable):
 
         # Return metrics
         metrics = {
-            "loss": loss.item(),
+            "loss": loss_value,
             "reward_mean": all_rewards_tensor.mean().item(),
             "reward_std": all_rewards_tensor.std().item(),
             "advantage_mean": advantages.mean().item(),

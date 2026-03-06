@@ -18,7 +18,10 @@ from torchtitan.experiments.rl.unified.actors.generator import (
     SamplingConfig,
     VLLMGenerator,
 )
-from torchtitan.experiments.rl.unified.actors.trainer import PolicyTrainer
+from torchtitan.experiments.rl.unified.actors.trainer import (
+    PolicyTrainer,
+    TrainerCompileConfig,
+)
 from torchtitan.experiments.rl.unified.simple_grpo import RLTrainer
 from torchtitan.models.qwen3 import model_registry
 
@@ -39,6 +42,9 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
             training=TrainingConfig(),
             parallelism=ParallelismConfig(
                 tensor_parallel_degree=2,
+            ),
+            compile=TrainerCompileConfig(
+                max_seq_len=512, cudagraph=True, microbatch_size=1
             ),
         ),
         generator=VLLMGenerator.Config(
