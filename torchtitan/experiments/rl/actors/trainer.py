@@ -21,13 +21,14 @@ from torch.distributed.checkpoint.state_dict import (
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import CommConfig, Configurable, TORCH_DTYPE_MAP
-from torchtitan.config.configs import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config.configs import ParallelismConfig, TrainingConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.experiments.rl.actors.utils import (
     compute_policy_gradient_loss,
     compute_token_log_probs,
     verify_logprob_identity,
 )
+from torchtitan.experiments.rl.compile import RLCompileConfig
 from torchtitan.experiments.rl.types import Episode
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools import utils
@@ -61,7 +62,7 @@ class PolicyTrainer(Actor, Configurable):
         parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
         comm: CommConfig = field(default_factory=CommConfig)
         """Communication configuration for distributed initialization."""
-        compile: CompileConfig = field(default_factory=CompileConfig)
+        compile: RLCompileConfig = field(default_factory=RLCompileConfig)
 
     def __init__(
         self,
@@ -79,6 +80,16 @@ class PolicyTrainer(Actor, Configurable):
         training_dtype = TORCH_DTYPE_MAP[config.training.dtype]
         requested = TORCH_DTYPE_MAP[transfer_dtype] if transfer_dtype else None
         self._transfer_dtype = requested if requested != training_dtype else None
+
+        # Silence noisy torchstore shared-memory logs in this actor process
+        logging.getLogger("torchstore.transport.shared_memory").setLevel(
+            logging.WARNING
+        )
+
+        # Use mesh-specific port to avoid collisions with other meshes
+        dist_port = os.environ.get("_TORCHTITAN_DIST_PORT")
+        if dist_port is not None:
+            os.environ["MASTER_PORT"] = dist_port
 
         # Device setup
         device_module, device_type = utils.device_module, utils.device_type
@@ -140,6 +151,18 @@ class PolicyTrainer(Actor, Configurable):
         self.dp_size = self.parallel_dims.dp_replicate * self.parallel_dims.dp_shard
         self.dp_rank = dist.get_rank() // self.parallel_dims.non_data_parallel_size
         self.dp_enabled = self.parallel_dims.dp_enabled
+
+        # AOT compilation captures a static graph — all forward calls must
+        # use identical tensor shapes.  Pad sequences to a fixed length
+        # determined from the first training step.
+        # CUDAGraph additionally requires per-sample backward: each sample's
+        # autograd graph must be freed before the next forward call because
+        # CUDAGraph replay reuses GPU buffers for activations.
+        self._needs_seq_padding = (
+            config.compile.enable and config.compile.mode is not None
+        )
+        self._needs_per_sample_backward = "cudagraph" in (config.compile.passes or [])
+        self._padded_seq_len: int | None = None
 
         logger.debug(
             f"PolicyTrainer initialized (dp_rank={self.dp_rank}, dp_size={self.dp_size})"
@@ -235,14 +258,28 @@ class PolicyTrainer(Actor, Configurable):
         means "skip StorageVolumes and let the destination read directly
         from the source's GPU memory".
         """
-        from monarch.rdma import is_rdma_available
-
         await ts.put_state_dict(
             self.model.state_dict(),
             "model_state_dict",
-            direct_rdma=is_rdma_available(),
+            direct_rdma=False,
             transfer_dtype=self._transfer_dtype,
         )
+
+    @endpoint
+    async def close(self) -> None:
+        """Tear down compiled resources (e.g. cudagraph pools).
+
+        Call this before shutting down the actor to release GPU memory
+        held by the compile pipeline.
+        """
+        from torchtitan.experiments.graph_trainer.graph_utils import CompiledModule
+
+        if isinstance(self.model, CompiledModule):
+            joint = getattr(self.model, "joint_graph_module", None)
+            teardown = getattr(joint, "cudagraph_teardown", None)
+            if teardown is not None:
+                teardown()
+                logger.info("Cudagraph teardown completed for policy model")
 
     @endpoint
     async def step(self, episodes: list[Episode]) -> dict:
@@ -279,15 +316,39 @@ class PolicyTrainer(Actor, Configurable):
         my_token_log_probs = [all_token_log_probs[i] for i in my_indices]
         my_advantages = advantages[my_indices]
 
+        # CUDAGraph requires identical tensor shapes on every forward call.
+        # Compute a fixed padded length from the first step and reuse it.
+        pad_to_length = None
+        if self._needs_seq_padding:
+            max_seq_len = max(
+                len(p) + len(g) for p, g in zip(my_prompt_token_ids, my_token_ids)
+            )
+            if self._padded_seq_len is None:
+                # Round up to next multiple of 128 for stable shapes.
+                self._padded_seq_len = ((max_seq_len + 127) // 128) * 128
+                logger.info(
+                    f"CUDAGraph padding: max_seq_len={max_seq_len}, "
+                    f"padded_seq_len={self._padded_seq_len}"
+                )
+            pad_to_length = self._padded_seq_len
+
         # Compute reference log probs using frozen ref_model (local shard only)
         ref_token_log_probs = []
         device = next(self.model.parameters()).device
         with torch.no_grad():
             for prompt_toks, gen_toks in zip(my_prompt_token_ids, my_token_ids):
                 token_lps = compute_token_log_probs(
-                    self.ref_model, prompt_toks, gen_toks, device
+                    self.ref_model,
+                    prompt_toks,
+                    gen_toks,
+                    device,
+                    pad_to_length=pad_to_length,
                 )
                 ref_token_log_probs.append(token_lps)
+
+        # Zero gradients before loss computation — required when
+        # backward_per_sample accumulates gradients inside the call.
+        self.optimizers.zero_grad()
 
         # Compute loss on this rank's shard
         loss, loss_metrics, batch_token_log_probs = compute_policy_gradient_loss(
@@ -297,6 +358,8 @@ class PolicyTrainer(Actor, Configurable):
             my_advantages,
             ref_token_log_probs,
             kl_coef=0.1,
+            pad_to_length=pad_to_length,
+            backward_per_sample=self._needs_per_sample_backward,
         )
 
         # Verify logprob identity (local shard)
@@ -312,9 +375,9 @@ class PolicyTrainer(Actor, Configurable):
             f"tokens_checked={verification_result['total_tokens_checked']}"
         )
 
-        # Update weights
-        self.optimizers.zero_grad()
-        loss.backward()
+        # Update weights (backward already done if per-sample mode)
+        if loss.requires_grad:
+            loss.backward()
 
         # All-reduce gradients across DP ranks so all ranks have consistent
         # weight updates despite processing different data shards.

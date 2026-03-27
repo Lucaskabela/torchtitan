@@ -13,6 +13,7 @@ def compute_token_log_probs(
     prompt_token_ids: list[int],
     gen_token_ids: list[int],
     device: torch.device,
+    pad_to_length: int | None = None,
 ) -> torch.Tensor:
     """
     Compute per-token log probabilities for generated tokens.
@@ -22,11 +23,24 @@ def compute_token_log_probs(
         prompt_token_ids: Token IDs for the prompt
         gen_token_ids: Token IDs for the generated completion
         device: Device to run computation on
+        pad_to_length: If set, pad the input to this fixed length. Required
+            for AOT/CUDAGraph compatibility since captured graphs need identical
+            tensor shapes on every call. Causal attention ensures padding
+            tokens at the end do not affect logits at real positions.
 
     Returns:
         Per-token log probabilities for the generated tokens
     """
     full_sequence = prompt_token_ids + gen_token_ids
+    actual_seq_len = len(full_sequence)
+
+    if pad_to_length is not None:
+        assert actual_seq_len <= pad_to_length, (
+            f"Sequence length {actual_seq_len} exceeds pad_to_length "
+            f"{pad_to_length}. Increase the padded length or reduce max_tokens."
+        )
+        full_sequence = full_sequence + [0] * (pad_to_length - actual_seq_len)
+
     full_tensor = torch.tensor(
         full_sequence, dtype=torch.long, device=device
     ).unsqueeze(0)
@@ -38,7 +52,7 @@ def compute_token_log_probs(
     seq_len = full_tensor.shape[1]
     positions = torch.arange(seq_len, device=device).unsqueeze(0)
 
-    logits = model(full_tensor, attention_masks=None, positions=positions)
+    logits = model(full_tensor, positions=positions)
 
     # Convert to float32 for numerical stability
     logits_f32 = logits[:, :-1, :].to(torch.float32)
@@ -59,6 +73,50 @@ def compute_token_log_probs(
     return token_lps
 
 
+def _compute_sample_loss(
+    token_lps: torch.Tensor,
+    ref_token_lps: torch.Tensor,
+    advantage: torch.Tensor,
+    kl_coef: float,
+    ppo_clip_eps: float,
+    entropy_coef: float,
+) -> tuple[torch.Tensor, dict]:
+    """Compute loss for a single sample (used in per-sample backward mode).
+
+    When CUDAGraph is enabled, we must complete backward before the next
+    forward call because CUDAGraph replay reuses GPU buffers. This helper
+    computes a single sample's loss so it can be immediately backpropagated.
+
+    Returns:
+        loss: Scalar loss for this sample
+        metrics: Dict of scalar metric values
+    """
+    token_log_ratio = token_lps - ref_token_lps.detach()
+    mean_log_ratio = token_log_ratio.mean()
+    token_ratio = torch.exp(token_log_ratio)
+    kl = (token_ratio - 1 - token_log_ratio).mean()
+
+    ratio = torch.exp(mean_log_ratio)
+    unclipped = ratio * advantage
+    clipped_ratio = torch.clamp(ratio, 1 - ppo_clip_eps, 1 + ppo_clip_eps)
+    clipped = clipped_ratio * advantage
+    pg_loss = -torch.min(unclipped, clipped)
+
+    entropy = -token_lps.mean()
+    entropy_bonus = -entropy_coef * entropy
+
+    loss = pg_loss + entropy_bonus + kl_coef * kl
+
+    metrics = {
+        "pg_loss": pg_loss.item(),
+        "entropy": entropy.item(),
+        "kl_div": kl.item(),
+        "ratio": ratio.item(),
+        "clipped_frac": float(abs(ratio.item() - clipped_ratio.item()) > 1e-6),
+    }
+    return loss, metrics
+
+
 def compute_policy_gradient_loss(
     model: torch.nn.Module,
     vllm_token_ids: list[list[int]],
@@ -68,6 +126,8 @@ def compute_policy_gradient_loss(
     kl_coef: float = 0.1,
     ppo_clip_eps: float = 0.2,
     entropy_coef: float = 0.01,
+    pad_to_length: int | None = None,
+    backward_per_sample: bool = False,
 ) -> tuple[torch.Tensor, dict, list[torch.Tensor]]:
     """
     Compute GRPO/PPO policy gradient loss with per-token KL divergence.
@@ -84,20 +144,74 @@ def compute_policy_gradient_loss(
         kl_coef: KL divergence penalty coefficient
         ppo_clip_eps: PPO clipping epsilon
         entropy_coef: Entropy bonus coefficient
+        pad_to_length: Fixed sequence length for AOT/CUDAGraph padding.
+        backward_per_sample: If True, run forward+backward per sample with
+            gradient accumulation. Required for CUDAGraph because graph replay
+            reuses GPU buffers — completing backward before the next forward
+            prevents buffer corruption. Caller must zero_grad before calling.
 
     Returns:
-        loss: Total loss (PG + entropy + KL)
+        loss: Total loss (detached if backward_per_sample, else with grad)
         metrics: Training metrics dict
         batch_token_log_probs: List of per-token log probs for each sample (for verification)
     """
     device = next(model.parameters()).device
     advantages = advantages.to(device)
+    batch_size = len(vllm_token_ids)
 
+    if backward_per_sample:
+        # Per-sample forward+backward: each sample's autograd graph is freed
+        # before the next forward, so CUDAGraph buffer reuse is safe.
+        total_loss_val = 0.0
+        agg_metrics: dict[str, float] = {}
+        batch_token_log_probs = []
+
+        for i, (prompt_toks, gen_toks) in enumerate(
+            zip(prompt_token_ids, vllm_token_ids)
+        ):
+            token_lps = compute_token_log_probs(
+                model, prompt_toks, gen_toks, device, pad_to_length=pad_to_length
+            )
+            batch_token_log_probs.append(token_lps.detach())
+
+            sample_loss, sample_metrics = _compute_sample_loss(
+                token_lps,
+                ref_token_log_probs[i],
+                advantages[i],
+                kl_coef,
+                ppo_clip_eps,
+                entropy_coef,
+            )
+            # Scale by 1/batch_size for gradient accumulation equivalence
+            (sample_loss / batch_size).backward()
+
+            total_loss_val += sample_loss.item() / batch_size
+            for k, v in sample_metrics.items():
+                agg_metrics[k] = agg_metrics.get(k, 0.0) + v / batch_size
+
+        # Return detached loss — backward already happened
+        loss = torch.tensor(total_loss_val, device=device)
+        metrics = {
+            "pg_loss": agg_metrics["pg_loss"],
+            "entropy": agg_metrics["entropy"],
+            "kl_div": agg_metrics["kl_div"],
+            "ratio_mean": agg_metrics["ratio"],
+            "ratio_clipped_frac": agg_metrics["clipped_frac"],
+        }
+        return loss, metrics, batch_token_log_probs
+
+    # --- Standard batch path (no CUDAGraph) ---
     # Compute per-token log probs under current policy (WITH GRADIENTS)
     batch_token_log_probs = []
 
     for prompt_toks, gen_toks in zip(prompt_token_ids, vllm_token_ids):
-        token_lps = compute_token_log_probs(model, prompt_toks, gen_toks, device)
+        token_lps = compute_token_log_probs(
+            model,
+            prompt_toks,
+            gen_toks,
+            device,
+            pad_to_length=pad_to_length,
+        )
         batch_token_log_probs.append(token_lps)
 
     # Per-token log ratios and KL, averaged across tokens per sample

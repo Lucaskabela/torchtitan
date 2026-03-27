@@ -26,6 +26,7 @@ import asyncio
 import logging
 import os
 import re
+import socket
 import time
 from collections import defaultdict
 from collections.abc import Callable
@@ -48,8 +49,15 @@ from torchtitan.protocols.model_spec import ModelSpec
 logger = logging.getLogger(__name__)
 
 
+def _find_free_port() -> int:
+    """Find a free TCP port by binding to port 0 and reading the OS assignment."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
 class Provisioner:
-    """Allocates non-overlapping GPU ranges for Monarch proc meshes.
+    """Allocates non-overlapping GPU ranges and unique dist ports for Monarch proc meshes.
 
     In non-colocated mode, the trainer and generator run on separate GPU
     meshes (e.g. GPUs 0-3 for training, GPUs 4-7 for generation). Each
@@ -57,6 +65,9 @@ class Provisioner:
     bootstrap callable that sets ``CUDA_VISIBLE_DEVICES`` before CUDA
     initializes in the spawned process, ensuring each mesh only sees its
     own devices.
+
+    Each mesh also gets a unique ``_TORCHTITAN_DIST_PORT`` so that
+    ``init_process_group`` calls in different meshes never collide.
     """
 
     def __init__(self, total_gpus: int = 8):
@@ -75,9 +86,12 @@ class Provisioner:
             )
         gpu_ids = list(range(self.next_gpu, self.next_gpu + num_gpus))
         self.next_gpu += num_gpus
+        # Find a free port now; all processes in this mesh will use it.
+        dist_port = str(_find_free_port())
 
         def _bootstrap():
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+            os.environ["_TORCHTITAN_DIST_PORT"] = dist_port
 
         return _bootstrap
 
@@ -305,6 +319,10 @@ class RLTrainer(Configurable):
         logger.info(f"Starting RL training for {num_steps} steps")
         logger.info("=" * 80)
 
+        # Aggregate timing accumulators
+        timing_totals: dict[str, float] = defaultdict(float)
+        train_start = time.perf_counter()
+
         for step in range(num_steps):
             # Generate data sample for this step
             train_prompts = []
@@ -321,16 +339,21 @@ class RLTrainer(Configurable):
             # Fully sync RL loop (GRPO)
             # 1. Generator produces flat list of Episodes with group_id
             # TODO: Create a queue to use all episodes from all GPUs
+            t0 = time.perf_counter()
             episodes = (
                 self.generator.generate.call(train_prompts, train_answers)
                 .get()
                 .item(gpus=0)
             )
+            t_generate = time.perf_counter() - t0
 
             # 2. Grader computes rewards per episode
+            t0 = time.perf_counter()
             episodes = self.grader.score.call(episodes).get().item()
+            t_grade = time.perf_counter() - t0
 
             # 3. Controller computes GRPO advantages (normalize within group)
+            t0 = time.perf_counter()
             groups: dict[str, list[int]] = defaultdict(list)
             for idx, ep in enumerate(episodes):
                 groups[ep.group_id].append(idx)
@@ -339,22 +362,32 @@ class RLTrainer(Configurable):
                 mean_reward = rewards.mean().item()
                 for i in indices:
                     episodes[i].advantage = episodes[i].reward - mean_reward
+            t_advantage = time.perf_counter() - t0
 
             if self.config.log_samples:
                 _log_samples(episodes)
 
             # 4. Trainer updates policy using episodes with advantages
+            t0 = time.perf_counter()
             metrics = self.trainer.step.call(episodes).get().item(gpus=0)
+            t_train = time.perf_counter() - t0
 
             # 5. Sync weights
             t0 = time.perf_counter()
             self.trainer.push_model_state_dict.call().get()
             t_push = time.perf_counter() - t0
             self.generator.pull_model_state_dict.call(metrics["policy_version"]).get()
-            t_total = time.perf_counter() - t0
-            logger.info(f"Weight sync: push={t_push:.3f}s, total={t_total:.3f}s")
+            t_weight_sync = time.perf_counter() - t0
 
             t_step = time.perf_counter() - step_start
+
+            # Accumulate timing
+            timing_totals["generate"] += t_generate
+            timing_totals["grade"] += t_grade
+            timing_totals["advantage"] += t_advantage
+            timing_totals["train"] += t_train
+            timing_totals["weight_sync"] += t_weight_sync
+            timing_totals["step"] += t_step
 
             all_token_lens = [len(ep.token_ids) for ep in episodes]
             avg_len = sum(all_token_lens) / len(all_token_lens)
@@ -370,7 +403,9 @@ class RLTrainer(Configurable):
                 f"Avg tokens: {avg_len:>3.0f} | "
                 f"Logprob diff: mean={metrics['logprob_diff_mean']:.4e}, "
                 f"max={metrics['logprob_diff_max']:.4e} | "
-                f"Time: {t_step:.1f}s"
+                f"Time: {t_step:.1f}s "
+                f"[gen={t_generate:.1f}s train={t_train:.1f}s "
+                f"sync={t_weight_sync:.1f}s grade={t_grade:.1f}s]"
             )
 
             # Check for divergence
@@ -379,6 +414,29 @@ class RLTrainer(Configurable):
                 logger.info("ERROR: Loss is NaN/Inf! Training diverged.")
                 logger.info("!" * 80)
                 break
+
+        # Aggregate timing summary
+        total_train_time = time.perf_counter() - train_start
+        completed_steps = step + 1
+        logger.info("=" * 80)
+        logger.info(
+            f"Timing summary ({completed_steps} steps, "
+            f"total={total_train_time:.1f}s):"
+        )
+        for component in ["generate", "train", "weight_sync", "grade", "advantage"]:
+            total = timing_totals[component]
+            avg = total / completed_steps
+            pct = 100 * total / total_train_time if total_train_time > 0 else 0
+            logger.info(
+                f"  {component:>12s}: {total:7.1f}s total, "
+                f"{avg:5.1f}s avg, {pct:5.1f}%"
+            )
+        logger.info("=" * 80)
+
+        # Release compiled resources (e.g. cudagraph pools) before
+        # evaluation to free GPU memory.  Also required for clean NCCL
+        # shutdown when cudagraphs are enabled.
+        self.trainer.close.call().get()
 
         # Post-training evaluation
         logger.info("RL Training complete")
@@ -401,6 +459,8 @@ class RLTrainer(Configurable):
 
 async def main():
     """Run the distributed RL training loop using Monarch."""
+    # Silence noisy "Tensor is a view/slice" info from torchstore shared memory
+    logging.getLogger("torchstore.transport.shared_memory").setLevel(logging.WARNING)
     config = ConfigManager().parse_args()
     rl_trainer = RLTrainer(config)
     await rl_trainer.setup()

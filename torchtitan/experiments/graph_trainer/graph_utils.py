@@ -139,6 +139,26 @@ def joint_graph_builder(
         model_kwargs,
         dump_folder=dump_folder,
     )
+    # Build name→tensor maps that include duplicates for weight-tied
+    # parameters (model.parameters() deduplicates by tensor id, which
+    # drops the second name in tied pairs like tok_embeddings.weight /
+    # output.weight).  params_spec may list both names, so we need the
+    # full mapping.
+    _param_map: dict[str, torch.Tensor] = {}
+    for mod_name, mod in model.named_modules():
+        for p_name, p in mod._parameters.items():
+            if p is not None:
+                full = f"{mod_name}.{p_name}" if mod_name else p_name
+                _param_map[full] = p
+    _buffer_map: dict[str, torch.Tensor] = {}
+    for mod_name, mod in model.named_modules():
+        for b_name, b in mod._buffers.items():
+            if b is not None:
+                full = f"{mod_name}.{b_name}" if mod_name else b_name
+                _buffer_map[full] = b
+
+    params_spec = joint_with_descriptors.params_spec
+    buffers_spec = joint_with_descriptors.buffers_spec
 
     # Check if inductor_decomposition is configured and create the pass with proper context
     if compile_config is not None:
@@ -178,9 +198,15 @@ def joint_graph_builder(
         on_compile(fn, joint_with_descriptors.out_spec)
 
     def wrapper_fn(args, kwargs):
+        # Use params_spec/buffers_spec to pass parameters in the exact
+        # order and count that the AOT graph expects.  This handles
+        # weight-tied models where the same tensor appears under
+        # multiple names (e.g. tok_embeddings.weight == output.weight).
+        params = [_param_map[name] for name in params_spec]
+        buffers = [_buffer_map[name] for name in buffers_spec]
         inputs = [
-            *model.parameters(),
-            *model.buffers(),
+            *params,
+            *buffers,
             *args,
         ]
         return fn(*inputs, **kwargs)

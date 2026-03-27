@@ -166,6 +166,11 @@ class VLLMGenerator(Actor, Configurable):
         self.config = config
         self.model_spec = model_spec
 
+        # Use mesh-specific port to avoid collisions with other meshes
+        dist_port = os.environ.get("_TORCHTITAN_DIST_PORT")
+        if dist_port is not None:
+            os.environ["MASTER_PORT"] = dist_port
+
         # Register TorchTitan model with vLLM before any engine creation
         register_model_to_vllm_model_registry(model_spec)
 
@@ -209,6 +214,11 @@ class VLLMGenerator(Actor, Configurable):
         if config.seed is not None:
             engine_kwargs["seed"] = config.seed
         engine_args = EngineArgs(**engine_kwargs)
+
+        # Silence noisy torchstore shared-memory logs in this actor process
+        logging.getLogger("torchstore.transport.shared_memory").setLevel(
+            logging.WARNING
+        )
 
         logger.info("Initializing LLMEngine from EngineArgs...")
         self._engine = LLMEngine.from_engine_args(engine_args)
@@ -318,14 +328,12 @@ class VLLMGenerator(Actor, Configurable):
         Args:
             version: New policy version number.
         """
-        from monarch.rdma import is_rdma_available
-
         model_sd = self._get_model().model.state_dict()
         await ts.get_state_dict(
             "model_state_dict",
             user_state_dict=model_sd,
             strict=False,
-            direct_rdma=is_rdma_available(),
+            direct_rdma=False,
         )
         self.policy_version = version
         logger.debug(
