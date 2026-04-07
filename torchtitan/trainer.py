@@ -321,6 +321,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             config.compile, parallel_dims=parallel_dims
         )
 
+        if config.compile.chunked_loss:
+            if not config.compile.enable:
+                raise ValueError("compile.chunked_loss requires compile.enable=True")
+            if parallel_dims.pp_enabled:
+                raise ValueError(
+                    "compile.chunked_loss is not compatible with pipeline parallelism"
+                )
+
         # verify batch sizes
         global_batch_size = config.training.global_batch_size
         if global_batch_size < 0:
@@ -407,6 +415,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 # autoparallel contains the wrap_init_states
                 cast(BaseModel, model).init_weights(buffer_device=buffer_device)
             model.train()
+
+            if config.compile.chunked_loss:
+                if not isinstance(model, Decoder):
+                    raise TypeError(
+                        f"compile.chunked_loss requires a Decoder model, "
+                        f"got {type(model).__name__}"
+                    )
+                from torchtitan.components.loss import build_chunked_loss
+
+                self._output_head_and_loss = build_chunked_loss(model, config.compile)
+                model._return_hidden_states = True
 
             self.model_parts = [model]
 
@@ -700,7 +719,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 with self.maybe_enable_amp:
                     pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
                     # Compute loss sum (reduction='sum')
-                    loss_sum = self.loss_fn(pred, labels)
+                    if self.config.compile.chunked_loss:
+                        # pred is hidden states; fused norm+output+loss
+                        loss_sum = self._output_head_and_loss(pred, labels)
+                    else:
+                        loss_sum = self.loss_fn(pred, labels)
 
                     # Scale the loss by the inverse of the total weight denominator before backward
                     # This ensures gradients are properly normalized across all microbatches

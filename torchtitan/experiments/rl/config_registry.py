@@ -31,7 +31,7 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
         model_spec=model_spec,
         hf_assets_path="torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B",
         num_steps=10,
-        batch_invariant_mode=True,
+        batch_invariant_mode=False,
         trainer=PolicyTrainer.Config(
             optimizer=OptimizersContainer.Config(lr=2e-6),
             lr_scheduler=LRSchedulersContainer.Config(
@@ -42,7 +42,7 @@ def rl_grpo_qwen3_0_6b() -> RLTrainer.Config:
             parallelism=ParallelismConfig(
                 tensor_parallel_degree=2,
             ),
-            compile=CompileConfig(enable=True, backend="aot_eager"),
+            compile=CompileConfig(enable=True, backend="aot_eager", chunked_loss=True),
         ),
         generator=VLLMGenerator.Config(
             model_dtype="bfloat16",

@@ -352,6 +352,18 @@ class CompileConfig:
 
     backend: str = "inductor"
 
+    chunked_loss: bool = False
+    """
+    Reduce peak memory from the vocabulary projection by chunking.
+    With backend="inductor", uses the auto_chunker FX pass.
+    With other backends, uses manual chunking with gradient checkpointing.
+    Requires compile.enable=True. Incompatible with pipeline parallelism.
+    """
+
+    chunked_loss_num_chunks: int | None = None
+    """Number of chunks for auto_chunker (inductor) or manual chunking.
+    None = auto-determined by inductor, or 4 for manual chunking."""
+
 
 @dataclass(kw_only=True, slots=True)
 class CommConfig:

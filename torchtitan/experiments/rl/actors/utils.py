@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from torchtitan.models.common.attention import VarlenMetadata
 
@@ -29,6 +30,73 @@ def build_varlen_metadata(
     return VarlenMetadata(
         cu_seq_q=cu_seqs, cu_seq_k=cu_seqs, max_q=max_len, max_k=max_len
     )
+
+
+_DEFAULT_RL_NUM_CHUNKS = 4
+
+
+def _chunk_output_and_gather(
+    output_proj: torch.nn.Module,
+    h_chunk: torch.Tensor,
+    target_chunk: torch.Tensor,
+) -> torch.Tensor:
+    """Compute output projection, log_softmax, and gather for one chunk."""
+    logits = output_proj(h_chunk)
+    log_probs = F.log_softmax(logits.to(torch.float32), dim=-1)
+    return log_probs.gather(2, target_chunk.unsqueeze(-1)).squeeze(-1)
+
+
+def chunked_compute_token_log_probs(
+    model: torch.nn.Module,
+    prompt_ids: list[int],
+    gen_ids: list[int],
+    device: torch.device,
+    num_chunks: int = _DEFAULT_RL_NUM_CHUNKS,
+) -> torch.Tensor:
+    """Memory-efficient compute_token_log_probs via chunked output projection.
+
+    Requires ``model._return_hidden_states = True`` so the model returns
+    hidden states before norm + output. Chunks the vocab projection to avoid
+    materializing the full ``[seq_len, vocab_size]`` logits tensor.
+    """
+    token_ids = torch.tensor(prompt_ids + gen_ids, dtype=torch.long, device=device)
+    prompt_len = len(prompt_ids)
+    gen_len = len(gen_ids)
+    attention_masks = build_varlen_metadata([(token_ids, prompt_len, gen_len)], device)
+
+    full_tensor = token_ids.unsqueeze(0)
+    seq_len = full_tensor.shape[1]
+    positions = torch.arange(seq_len, device=device).unsqueeze(0)
+
+    # Model returns hidden states (before norm + output projection)
+    hidden = model(full_tensor, attention_masks=attention_masks, positions=positions)
+
+    # Norm is cheap ([1, seq_len, dim]) -- apply on full tensor
+    h = model.norm(hidden)
+
+    # Chunk along sequence dim for the output projection
+    h_shifted = h[:, :-1, :]  # [1, seq_len-1, dim]
+    target_tokens = full_tensor[:, 1:]  # [1, seq_len-1]
+
+    h_chunks = h_shifted.chunk(num_chunks, dim=1)
+    target_chunks = target_tokens.chunk(num_chunks, dim=1)
+
+    all_gathered = []
+    for h_chunk, t_chunk in zip(h_chunks, target_chunks):
+        gathered = torch.utils.checkpoint.checkpoint(
+            _chunk_output_and_gather,
+            model.output,
+            h_chunk,
+            t_chunk,
+            use_reentrant=False,
+        )
+        all_gathered.append(gathered)
+
+    all_log_probs = torch.cat(all_gathered, dim=1).squeeze(0)  # [seq_len-1]
+
+    gen_start_idx = prompt_len - 1
+    gen_end_idx = gen_start_idx + gen_len
+    return all_log_probs[gen_start_idx:gen_end_idx]
 
 
 def compute_token_log_probs(
@@ -93,6 +161,7 @@ def compute_policy_gradient_loss(
     kl_coef: float = 0.1,
     ppo_clip_eps: float = 0.2,
     entropy_coef: float = 0.01,
+    log_probs_fn: callable = compute_token_log_probs,
 ) -> tuple[torch.Tensor, dict, list[torch.Tensor]]:
     """
     Compute GRPO/PPO policy gradient loss with per-token KL divergence.
@@ -122,7 +191,7 @@ def compute_policy_gradient_loss(
     batch_token_log_probs = []
 
     for prompt_toks, gen_toks in zip(prompt_token_ids, vllm_token_ids):
-        token_lps = compute_token_log_probs(
+        token_lps = log_probs_fn(
             model,
             prompt_toks,
             gen_toks,

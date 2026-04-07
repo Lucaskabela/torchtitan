@@ -24,6 +24,7 @@ from torchtitan.config import CommConfig, Configurable, TORCH_DTYPE_MAP
 from torchtitan.config.configs import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.experiments.rl.actors.utils import (
+    chunked_compute_token_log_probs,
     compute_policy_gradient_loss,
     compute_token_log_probs,
     verify_logprob_identity,
@@ -114,6 +115,15 @@ class PolicyTrainer(Actor, Configurable):
             p.requires_grad = False
         ref_model.eval()
         self.ref_model = ref_model
+
+        self._chunked_loss = config.compile.chunked_loss
+        if self._chunked_loss:
+            model._return_hidden_states = True
+            ref_model._return_hidden_states = True
+            self._chunked_loss_num_chunks = config.compile.chunked_loss_num_chunks or 4
+            logger.info(
+                f"Chunked log_probs enabled (num_chunks={self._chunked_loss_num_chunks})"
+            )
 
         # Build optimizer and LR scheduler
         self.optimizers = config.optimizer.build(model_parts=self.model_parts)
@@ -286,9 +296,17 @@ class PolicyTrainer(Actor, Configurable):
         # Compute reference log probs using frozen ref_model (local shard only)
         ref_token_log_probs = []
         device = next(self.model.parameters()).device
+
+        if self._chunked_loss:
+            _log_probs_fn = lambda model, p, g, d: chunked_compute_token_log_probs(
+                model, p, g, d, num_chunks=self._chunked_loss_num_chunks
+            )
+        else:
+            _log_probs_fn = compute_token_log_probs
+
         with torch.no_grad():
             for prompt_toks, gen_toks in zip(my_prompt_token_ids, my_token_ids):
-                token_lps = compute_token_log_probs(
+                token_lps = _log_probs_fn(
                     self.ref_model,
                     prompt_toks,
                     gen_toks,
@@ -304,6 +322,7 @@ class PolicyTrainer(Actor, Configurable):
             my_advantages,
             ref_token_log_probs,
             kl_coef=0.1,
+            log_probs_fn=_log_probs_fn,
         )
 
         # Verify logprob identity (local shard)

@@ -96,6 +96,8 @@ class Decoder(BaseModel):
         self.norm = config.norm.build()
         self.output = config.output.build()
 
+        self._return_hidden_states: bool = False
+
     def init_states(
         self,
         *,
@@ -132,6 +134,9 @@ class Decoder(BaseModel):
 
         for layer in self.layers.values():
             h = layer(h, self.freqs_cis, attention_masks, positions)
+
+        if self._return_hidden_states:
+            return h
 
         h = self.norm(h) if self.norm is not None else h
         output = self.output(h) if self.output is not None else h
